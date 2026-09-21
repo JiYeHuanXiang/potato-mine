@@ -80,7 +80,7 @@ Reports land in `watch-ips.json`, `watch-candidates.txt`, `watch-blockable.txt`.
 
 ```bash
 python potato_mine.py --check     # pre-flight: rights, audit ACE, event log, config
-python potato_mine.py --arm       # turn on file-system auditing + audit ACE
+python potato_mine.py --arm       # enable auditing: File System + Process Creation + audit ACE
 python potato_mine.py --run       # run it (add --dry-run to only log, never kill)
 ```
 
@@ -110,11 +110,20 @@ scan cannot: a programmatic `CopyFile`, an archiver walking the tree, a backup
 agent. The mine polls the Security log via `wevtutil` and classifies each event
 by the reader's process ancestry.
 
-**Layer B — birth check (process creation).**
-`Win32_ProcessStartTrace` events are streamed from a PowerShell sensor. When a
-new process's command line contains (a) a path inside the tool directory,
-(b) a copy/archive/upload verb, and (c) a destination outside it — a path or a
-URL — the process is killed immediately, regardless of who its parent is.
+**Layer B — birth check (process-creation auditing).**
+Process creation is logged by Windows (event 4688); the mine reads the Security
+log in-process and inspects every new process. A command line that contains
+(a) a path inside the tool directory, (b) a copy/archive/upload verb, and
+(c) a destination outside it — a path or a URL — is killed immediately,
+regardless of who its parent is. Because the audit event carries the parent's
+image path and the child's command line, this works even for processes that
+have already exited by the time they are classified.
+
+Both layers read the Security log **in-process** (a direct `wevtapi.dll` call),
+not by shelling out: spawning a reader process per poll would itself generate
+process-creation events, filling the fixed-size Security log until events are
+overwritten before they can be read — a self-reinforcing feedback loop that
+silently blinds the mine.
 
 ### Kill policy
 
@@ -126,6 +135,7 @@ URL — the process is killed immediately, regardless of who its parent is.
 | Layer A: unknown-origin process from a non-system path | **Kill** |
 | Layer A: your host apps, editors, terminals, file managers, antivirus, indexers | Warn only |
 | Layer A: orphaned ancestry (intermediate parent already exited) | Warn (add `--strict-orphans` to kill instead) |
+| Any case where the process could not be identified | Warn only — missing information is never treated as evidence |
 
 Every kill is recorded with the process name, PID, executable path, command
 line, full parent chain, and the files it had touched.
@@ -150,10 +160,17 @@ This is a defensive tool, so it is built to be boring about worst cases:
 - **Static observation, not interception.** `netwatch` reports what the OS
   connection table and capture show. A short-lived connection may come and go
   between samples. Absence of evidence is not proof of absence.
-- **Layer A latency.** The Security log is polled about every 1.5 s. A single
+- **Layer A latency.** The Security log is read about every 0.5-0.6 s. A single
   small file copied by a very short-lived process can complete before the
   classification runs. Bulk operations, directory walks, and archives — the
-  shapes that matter for exfiltration — are interrupted mid-flight.
+  shapes that matter for exfiltration — are interrupted mid-flight. Layer B
+  closes most of that gap because the audit event carries the command line,
+  so a copy is detected from its own creation, not from its reads.
+- **Security log size matters.** Arming turns on process-creation auditing,
+  which every process on the machine feeds. If your Security log is small and
+  already near capacity, older events are overwritten in a circular log;
+  `--check` reports the log's state. Raise the limit
+  (`wevtutil sl Security /ms:67108864`) if you see gaps.
 - **Layer B matches command lines.** A command line that merely *mentions* a
   copy (a shell running a script that contains the word `copy`) is treated as
   a shell-in-session and only warned about, precisely to avoid false kills.
@@ -205,6 +222,11 @@ Potato Mine 是两个互相配合的小工具：
 杀父进程；系统命脉、`explorer.exe`、你配置的宿主应用在任何代码路径下都
 不可被杀；地雷也拒绝击杀自己的祖先链。因此最坏情况只是某个用户态工具进程
 被终止（可重开），**不存在不可逆破坏路径**。
+
+**布雷做了什么**：`--arm` 会启用两个审计子类别（File System + Process
+Creation）与 4688 命令行记录策略，并给工具目录加上 `Everyone:ReadData`
+审计 ACE（含对既有文件的显式传播）。`--disarm` 会移除 ACE 并把命令行
+策略还原为原值；审计子类别保留启用（无 ACE 时不产生任何事件，属无害常态）。
 
 **配置**：复制 `watch-config.example.json` 为 `watch-config.json`，
 填入要监视的可执行文件名（`monitor_processes`）与你日常分析的宿主应用
