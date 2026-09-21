@@ -1302,11 +1302,16 @@ def run_checks(registry=None):
             continue
         present, detail = sacl_present(m.path)
         m.armed = present
+        if present:
+            state = "已布雷"
+        elif not m.enabled:
+            state = "未布雷（地雷已停用）"
+        else:
+            state = f"未布雷 — 未检测到 ACE [{detail[:60]}]"
         checks.append({
             "name": f"守护目录 {m.path}",
             "ok": present,
-            "detail": ("已布雷" if m.enabled else "已停用（未布雷）") +
-                      ("" if present else f" — 未检测到 ACE [{detail[:60]}]"),
+            "detail": state,
             "mine": m.id,
         })
 
