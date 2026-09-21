@@ -266,7 +266,7 @@ class ModelProviderMap:
 class Exclusions:
     """已知非 目标应用 的良性目标，显式排除，避免误伤。
 
-    典型：本机自己的 frp 服务端 101.201.41.76。
+    典型：本机自己的 frp 服务端 203.0.113.7。
     格式：  IP 或 CIDR 或 域名 | 说明
             proc:<进程名>   | 说明      ← 按进程排除（如 frpc.exe）
     """
@@ -1052,7 +1052,7 @@ def deep_report(m, packets):
                   + (f"   [{ex}]" if ex else ""))
     else:
         print("     （无）")
-    print("     · 本机自用服务（frp 101.201.41.76 等）已在 exclusions.txt 登记，不会误伤。")
+    print("     · 本机自用服务（frp 203.0.113.7 等）已在 exclusions.txt 登记，不会误伤。")
 
     # ---- 其他程序的 TLS 目标（透明说明，便于排除）
     if unattributed:

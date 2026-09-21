@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Potato Mine · 土豆地雷控制台</title>
+<style>
+  :root{
+    --bg:#14150f; --panel:#1c1e16; --panel2:#23261b; --line:#333724;
+    --txt:#e8e6dc; --dim:#9a9c86; --gold:#e0a83c; --ok:#4ea657;
+    --bad:#e05252; --warn:#d8942a; --blue:#5ca8e0;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font:14px/1.6 "Segoe UI","Microsoft YaHei",system-ui,sans-serif}
+  a{color:var(--blue)}
+  header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+         padding:16px 22px;border-bottom:1px solid var(--line);
+         background:linear-gradient(180deg,#1e2117,#17190f)}
+  header h1{margin:0;font-size:19px;letter-spacing:.5px}
+  header .sub{color:var(--dim);font-size:12px}
+  header .spacer{flex:1}
+  main{padding:20px 22px 60px;max-width:1120px;margin:0 auto}
+  .card{background:var(--panel);border:1px solid var(--line);
+        border-radius:10px;padding:16px 18px;margin-bottom:18px}
+  .card h2{margin:0 0 4px;font-size:15px;letter-spacing:.4px}
+  .card h2 .hint{font-weight:400;color:var(--dim);font-size:12px;margin-left:8px}
+  .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:10px 0}
+  label.lbl{display:block;color:var(--dim);font-size:12px;margin:12px 0 4px}
+  input[type=text]{background:var(--panel2);border:1px solid var(--line);
+    color:var(--txt);border-radius:6px;padding:7px 10px;min-width:240px}
+  input[type=text]:focus{outline:none;border-color:var(--gold)}
+  button{background:var(--panel2);border:1px solid var(--line);color:var(--txt);
+    border-radius:6px;padding:7px 13px;cursor:pointer;font-size:13px}
+  button:hover{border-color:var(--gold);color:var(--gold)}
+  button.primary{background:#3a3216;border-color:var(--gold);color:var(--gold)}
+  button.danger:hover{border-color:var(--bad);color:var(--bad)}
+  button:disabled{opacity:.45;cursor:default}
+  .badge{display:inline-block;padding:1px 8px;border-radius:20px;
+    font-size:11px;border:1px solid var(--line);color:var(--dim)}
+  .badge.ok{color:var(--ok);border-color:#2f5b34}
+  .badge.bad{color:var(--bad);border-color:#5b2f2f}
+  .badge.warn{color:var(--warn);border-color:#5b452a}
+  .badge.gold{color:var(--gold);border-color:#5b451f}
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:6px;
+       overflow:hidden}
+  .seg button{border:0;border-radius:0;background:transparent;padding:7px 16px}
+  .seg button.on{background:#3a3216;color:var(--gold)}
+  .switch{position:relative;width:44px;height:23px;border-radius:23px;
+    border:1px solid var(--line);background:#2a2c20;cursor:pointer;
+    transition:.18s;padding:0;flex:0 0 auto}
+  .switch::after{content:"";position:absolute;top:2px;left:2px;width:17px;
+    height:17px;border-radius:50%;background:#7b7d68;transition:.18s}
+  .switch.on{background:#3d4a2a;border-color:#4f6b33}
+  .switch.on::after{left:23px;background:var(--ok)}
+  .switch.warn.on{background:#4a3a20;border-color:#6b5226}
+  .switch.warn.on::after{background:var(--gold)}
+  table{width:100%;border-collapse:collapse;margin-top:8px}
+  th,td{text-align:left;padding:8px 8px;border-bottom:1px solid var(--line);
+        vertical-align:middle}
+  th{color:var(--dim);font-weight:500;font-size:12px}
+  td.path{font-family:Consolas,Menlo,monospace;font-size:13px;
+          word-break:break-all;max-width:520px}
+  .muted{color:var(--dim)}
+  .empty{padding:18px;text-align:center;color:var(--dim)}
+  .proc-list{max-height:190px;overflow:auto;border:1px solid var(--line);
+    border-radius:6px;background:var(--panel2);padding:6px}
+  .proc-item{display:flex;align-items:center;gap:8px;padding:3px 6px;
+             border-radius:4px}
+  .proc-item:hover{background:#2c2f20}
+  .proc-item label{flex:1;cursor:pointer;font-family:Consolas,monospace;
+                   font-size:12.5px}
+  .chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+  .chip{background:#332c14;border:1px solid var(--gold);color:var(--gold);
+    border-radius:20px;padding:2px 10px;font-size:12px;cursor:pointer}
+  .chip::after{content:" ×";opacity:.7}
+  code.kv{font-family:Consolas,monospace;font-size:12px;color:var(--dim)}
+  .note{background:#241f10;border-left:3px solid var(--gold);
+        padding:8px 12px;border-radius:4px;color:#d9cfae;font-size:12.5px}
+  .note.bad{border-color:var(--bad);background:#251414;color:#e6bcbc}
+  .ev{display:flex;gap:10px;padding:7px 0;border-bottom:1px solid #232619}
+  .ev:last-child{border-bottom:0}
+  .ev .k{flex:0 0 96px;font-size:11px;color:var(--dim);
+         font-family:Consolas,monospace}
+  .ev .k.KILL{color:var(--bad)}
+  .ev .k.KILL_DRYRUN{color:var(--warn)}
+  .ev .k.WARN{color:var(--blue)}
+  .ev .b{flex:1;min-width:0;word-break:break-word}
+  .ev .b .t{font-family:Consolas,monospace;font-size:12px}
+  .filters{display:flex;gap:6px;margin-bottom:6px}
+  .filters button{padding:4px 11px;font-size:12px}
+  .filters button.on{background:#3a3216;border-color:var(--gold);color:var(--gold)}
+  .dot{display:inline-block;width:7px;height:7px;border-radius:50%;
+       background:#6c6e58;margin-right:6px}
+  .dot.on{background:var(--ok)} .dot.off{background:#6c6e58}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>🥔 Potato Mine · 土豆地雷控制台</h1>
+    <div class="sub" id="hdr-sub">加载中…</div>
+  </div>
+  <div class="spacer"></div>
+  <div id="hdr-admin"></div>
+  <button id="btn-daemon" class="primary">守护总开关</button>
+</header>
+
+<main>
+  <!-- ------------------------------------------------ 全局设置 -->
+  <section class="card">
+    <h2>全局设置<span class="hint">对所有地雷生效</span></h2>
+
+    <label class="lbl">监视的主进程（被观察的应用，写回 watch-config.json）</label>
+    <div class="row">
+      <input type="text" id="procFilter" placeholder="搜索运行中的进程，例如 myapp.exe">
+      <button id="btn-proc-refresh">刷新进程列表</button>
+      <label class="muted"><input type="checkbox" id="showSystem"> 显示系统进程</label>
+    </div>
+    <div class="proc-list" id="procList"><div class="empty">加载中…</div></div>
+    <div class="chips" id="procChips"></div>
+    <div class="row">
+      <input type="text" id="procCustom" placeholder="或手动输入可执行文件名，如 myapp.exe">
+      <button id="btn-proc-add">添加</button>
+    </div>
+
+    <label class="lbl">可疑上传行为监视（托管 netwatch.py record）</label>
+    <div class="row">
+      <button class="switch" id="sw-upload" role="switch"></button>
+      <span id="upload-state" class="muted">—</span>
+    </div>
+
+    <label class="lbl">触发地雷后的行为</label>
+    <div class="row">
+      <div class="seg" id="seg-action">
+        <button data-action="warn">警告（只留档）</button>
+        <button data-action="explode">爆炸（击杀搬运进程）</button>
+      </div>
+      <button id="btn-apply-all">应用到全部地雷</button>
+    </div>
+    <div class="note" id="action-note"></div>
+  </section>
+
+  <!-- ------------------------------------------------ 地雷列表 -->
+  <section class="card">
+    <h2>正在运行的地雷<span class="hint" id="mine-counts">—</span></h2>
+    <div class="row">
+      <input type="text" id="minePath" placeholder="要守护的目录，例如 E:\my-project">
+      <button id="btn-mine-add" class="primary">添加地雷</button>
+    </div>
+    <table>
+      <thead>
+        <tr><th style="width:52%">守护目录</th><th style="width:22%">触发动作</th>
+            <th style="width:16%">地雷开关</th><th></th></tr>
+      </thead>
+      <tbody id="mineRows"></tbody>
+    </table>
+    <div class="note" id="mine-note" style="margin-top:12px"></div>
+  </section>
+
+  <!-- ------------------------------------------------ 事件 -->
+  <section class="card">
+    <h2>事件与取证<span class="hint" id="ev-file">—</span></h2>
+    <div class="filters" id="ev-filters">
+      <button data-kind="" class="on">全部</button>
+      <button data-kind="KILL">击杀</button>
+      <button data-kind="WARN">告警</button>
+      <button data-kind="START">启停</button>
+    </div>
+    <div id="evList"></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let PROCS = [];
+let SELECTED = [];
+let EVKIND = "";
+let BUSY = false;
+
+function esc(s){
+  return String(s == null ? "" : s)
+    .replaceAll("&","&amp;").replaceAll("<","&lt;")
+    .replaceAll(">","&gt;").replaceAll('"',"&quot;");
+}
+
+async function api(path, opts){
+  const r = await fetch(path, Object.assign({
+    headers: {"Content-Type":"application/json"}
+  }, opts||{}));
+  let data = null;
+  try { data = await r.json(); } catch(e) { data = {ok:false, error:"响应不是 JSON"}; }
+  if(!r.ok || data.ok === false){
+    throw new Error(data && data.error ? data.error : (data && data.message) || ("HTTP "+r.status));
+  }
+  return data;
+}
+const post = (path, body) => api(path, {method:"POST", body: JSON.stringify(body||{})});
+const del  = (path) => api(path, {method:"DELETE"});
+
+/* ------------------------------------------------ 渲染 */
+
+function renderHeader(s){
+  $("hdr-admin").innerHTML = s.admin
+    ? '<span class="badge ok">管理员</span>'
+    : '<span class="badge bad">非管理员 · 布雷/运行被拒绝</span>';
+  const d = s.daemon;
+  const bit = d.running
+    ? `<span class="dot on"></span>守护运行中 · PID ${d.pid}` +
+      (d.since ? ` · 自 ${esc(d.since)}` : "")
+    : `<span class="dot off"></span>守护未运行`;
+  const ext = (s.external||[]).length
+    ? ` · 另有命令行实例 ${s.external.join(",")}`
+    : "";
+  $("hdr-sub").innerHTML = `守护目录根 ${esc(s.root)}　|　${bit}${ext}`;
+  const b = $("btn-daemon");
+  b.textContent = d.running ? "停止守护（并排雷）" : "启动守护（并布雷）";
+  b.className = d.running ? "danger" : "primary";
+}
+
+function renderProcessPicker(){
+  const q = $("procFilter").value.trim().toLowerCase();
+  const sys = $("showSystem").checked;
+  const items = PROCS.filter(p => (sys || !p.system) &&
+                                  (!q || p.name.includes(q)))
+                     .slice(0, 300);
+  if(!items.length){
+    $("procList").innerHTML = '<div class="empty">无匹配进程</div>';
+    return;
+  }
+  $("procList").innerHTML = items.map(p => {
+    const on = SELECTED.includes(p.name);
+    return `<div class="proc-item">
+      <input type="checkbox" data-name="${esc(p.name)}" ${on?"checked":""}>
+      <label>${esc(p.name)} <span class="muted">×${p.count}</span></label>
+      ${p.system?'<span class="badge">系统</span>':""}
+    </div>`;
+  }).join("");
+  $("procList").querySelectorAll("input[data-name]").forEach(el => {
+    el.addEventListener("change", () => toggleProcess(el.dataset.name));
+  });
+}
+
+function renderChips(){
+  if(!SELECTED.length){
+    $("procChips").innerHTML = '<span class="muted">（未选择任何主进程）</span>';
+    return;
+  }
+  $("procChips").innerHTML = SELECTED
+    .map(n => `<span class="chip" data-name="${esc(n)}">${esc(n)}</span>`)
+    .join("");
+  $("procChips").querySelectorAll(".chip").forEach(el => {
+    el.addEventListener("click", () => toggleProcess(el.dataset.name));
+  });
+}
+
+function renderSettings(s){
+  const st = s.settings;
+  SELECTED = st.monitor_processes.slice();
+  renderChips();
+  renderProcessPicker();
+
+  const sw = $("sw-upload");
+  sw.classList.toggle("on", !!st.upload_monitor);
+  sw.setAttribute("aria-checked", st.upload_monitor ? "true" : "false");
+  const u = s.upload || {};
+  $("upload-state").innerHTML = st.upload_monitor
+    ? (u.running
+        ? `<span class="muted">监听中 · PID ${u.pid}` +
+          (u.since ? ` · 自 ${esc(u.since)}` : "") + `</span>`
+        : `<span class="badge bad">已启用但未运行</span> ` +
+          (u.error ? esc(u.error) : ""))
+    : '<span class="muted">已关闭（不累积出站目标与上传量）</span>';
+
+  $("seg-action").querySelectorAll("button").forEach(b => {
+    b.classList.toggle("on", b.dataset.action === st.action);
+  });
+  $("action-note").innerHTML = st.action === "explode"
+    ? "爆炸：地雷炸响时终止【执行搬运的那一个进程】（taskkill /F /PID，不带 /T）。" +
+      "不杀父进程、不连带子进程，取证全量落盘。"
+    : "警告：地雷炸响时只记全档（进程名/PID/父进程/命令行/文件），不终止任何进程。";
+}
+
+function renderMines(s){
+  const c = s.counts;
+  $("mine-counts").textContent =
+    `总计 ${c.total} 个 · ${c.running} 个正在运行 · ${c.armed} 个已布雷`;
+  const rows = s.mines;
+  if(!rows.length){
+    $("mineRows").innerHTML =
+      '<tr><td colspan="4"><div class="empty">还没有地雷，先添加一个守护目录。</div></td></tr>';
+  } else {
+    $("mineRows").innerHTML = rows.map(m => {
+      const badge = !m.exists
+        ? '<span class="badge bad">目录缺失</span>'
+        : (m.live ? '<span class="badge ok">运行中</span>'
+                  : (m.armed ? '<span class="badge warn">已布雷·守护未运行</span>'
+                             : '<span class="badge">已停用</span>'));
+      const act = m.action === "warn" ? "warn" : "explode";
+      return `<tr data-id="${esc(m.id)}">
+        <td class="path">${esc(m.path)} ${badge}
+          ${m.triggers ? `<br><code class="kv">已触发 ${m.triggers} 次</code>` : ""}
+          ${m.note ? `<br><code class="kv">${esc(m.note)}</code>` : ""}</td>
+        <td><select class="act">
+              <option value="warn" ${act==="warn"?"selected":""}>警告（只留档）</option>
+              <option value="explode" ${act==="explode"?"selected":""}>爆炸（击杀搬运进程）</option>
+            </select></td>
+        <td><button class="switch ${m.enabled?"on":""}" data-toggle="1"
+              aria-label="地雷开关"></button></td>
+        <td><button class="danger del">移除</button></td>
+      </tr>`;
+    }).join("");
+    $("mineRows").querySelectorAll("tr[data-id]").forEach(tr => {
+      const id = tr.dataset.id;
+      tr.querySelector("select.act").addEventListener("change", (e) => {
+        api("/api/mines/" + id, {method:"POST",
+          body: JSON.stringify({action: e.target.value})})
+          .then(() => refresh()).catch(showErr);
+      });
+      tr.querySelector("button[data-toggle]").addEventListener("click", () => {
+        const on = !tr.querySelector("button[data-toggle]").classList.contains("on");
+        api("/api/mines/" + id, {method:"POST",
+          body: JSON.stringify({enabled: on})})
+          .then(() => refresh()).catch(showErr);
+      });
+      tr.querySelector("button.del").addEventListener("click", () => {
+        if(!confirm("移除这个地雷？\n\n" + id)) return;
+        del("/api/mines/" + id).then(() => refresh()).catch(showErr);
+      });
+    });
+  }
+}
+
+function renderEvents(s){
+  $("ev-file").textContent = (s.events_meta && s.events_meta.file) || "";
+  let items = s.events || [];
+  if(EVKIND === "KILL"){
+    items = items.filter(e => e.kind === "KILL" || e.kind === "KILL_DRYRUN");
+  } else if(EVKIND === "START"){
+    items = items.filter(e => ["START","STOP","ARM","DISARM",
+      "UPLOAD_START","UPLOAD_STOP","START_FAILED"].includes(e.kind));
+  } else if(EVKIND){
+    items = items.filter(e => e.kind === EVKIND);
+  }
+  if(!items.length){
+    $("evList").innerHTML = '<div class="empty">暂无事件</div>';
+    return;
+  }
+  $("evList").innerHTML = items.slice(0, 60).map(e => {
+    const bits = [];
+    if(e.name) bits.push(esc(e.name));
+    if(e.pid != null) bits.push("pid " + esc(e.pid));
+    if(e.ppid != null) bits.push("父 " + esc(e.ppid) + (e.parent ? "("+esc(e.parent)+")" : ""));
+    let line = bits.join(" · ");
+    let extra = "";
+    if(e.reason) extra += `<div>${esc(e.reason)}</div>`;
+    if(e.note) extra += `<div class="muted">${esc(e.note)}</div>`;
+    if(e.file) extra += `<div class="t">文件 ${esc(e.file)}</div>`;
+    const dest = e.evidence && e.evidence.dest;
+    if(dest && dest.length) extra += `<div class="t">目的地 ${esc(dest.join(" "))}</div>`;
+    if(e.ancestry) extra += `<div class="t">祖先链 ${esc(e.ancestry)}</div>`;
+    if(e.cmdline) extra += `<div class="t">cmd ${esc(String(e.cmdline).slice(0,300))}</div>`;
+    return `<div class="ev">
+      <div class="k ${esc(e.kind)}">${esc(e.kind)}</div>
+      <div class="b"><div>${line || esc(e.kind)}</div>
+        <div class="muted" style="font-size:11px">${esc(e.ts)} ${e.mine?" · "+esc(e.mine):""}</div>
+        ${extra}</div>
+    </div>`;
+  }).join("");
+}
+
+function render(s){
+  renderHeader(s);
+  renderSettings(s);
+  renderMines(s);
+  renderEvents(s);
+  const hint = [];
+  if(!s.admin) hint.push("非管理员：布雷与运行会被拒绝。");
+  if(!s.settings.monitor_processes.length) hint.push("未选择主进程：上传监视无法归因。");
+  if((s.external||[]).length) hint.push("有命令行实例在跑，控制台不会重复托管。");
+  if(!s.daemon.running) hint.push("守护未运行：开关已保存，启动守护后生效。");
+  $("mine-note").innerHTML = hint.length
+    ? '<b>提示</b>：' + hint.map(esc).join(" ") : "";
+  $("mine-note").style.display = hint.length ? "block" : "none";
+}
+
+/* ------------------------------------------------ 动作 */
+
+async function toggleProcess(name){
+  const cur = SELECTED.slice();
+  const next = cur.includes(name) ? cur.filter(x => x !== name) : cur.concat([name]);
+  try{
+    const s = await post("/api/settings", {monitor_processes: next});
+    render(s);
+  }catch(e){ showErr(e); }
+}
+
+function showErr(e){
+  const box = $("mine-note");
+  box.style.display = "block";
+  box.className = "note bad";
+  box.innerHTML = "<b>出错</b>：" + esc(e.message || e);
+}
+
+/* ------------------------------------------------ 绑定 */
+
+$("btn-daemon").addEventListener("click", async () => {
+  const running = $("btn-daemon").textContent.indexOf("停止") === 0;
+  try{
+    const r = await post("/api/daemon", {enabled: !running});
+    render(r.state);
+  }catch(e){ showErr(e); }
+});
+
+$("sw-upload").addEventListener("click", async () => {
+  const on = !$("sw-upload").classList.contains("on");
+  try{
+    const s = await post("/api/settings", {upload_monitor: on});
+    render(s);
+  }catch(e){ showErr(e); }
+});
+
+$("seg-action").querySelectorAll("button").forEach(b => {
+  b.addEventListener("click", async () => {
+    try{
+      const s = await post("/api/settings", {action: b.dataset.action});
+      render(s);
+    }catch(e){ showErr(e); }
+  });
+});
+
+$("btn-apply-all").addEventListener("click", async () => {
+  try{
+    const s = await post("/api/settings", {apply_action_all: true});
+    render(s);
+  }catch(e){ showErr(e); }
+});
+
+$("btn-proc-add").addEventListener("click", async () => {
+  const v = $("procCustom").value.trim().toLowerCase();
+  if(!v) return;
+  if(!v.endsWith(".exe")) return showErr(new Error("请填可执行文件名，如 myapp.exe"));
+  $("procCustom").value = "";
+  if(SELECTED.includes(v)) return;
+  try{
+    const s = await post("/api/settings", {monitor_processes: SELECTED.concat([v])});
+    render(s);
+  }catch(e){ showErr(e); }
+});
+
+$("btn-proc-refresh").addEventListener("click", async () => {
+  const r = await api("/api/processes?refresh=1");
+  PROCS = r.items || [];
+  renderProcessPicker();
+});
+
+$("procFilter").addEventListener("input", renderProcessPicker);
+$("showSystem").addEventListener("change", renderProcessPicker);
+
+$("btn-mine-add").addEventListener("click", async () => {
+  const p = $("minePath").value.trim();
+  if(!p) return;
+  try{
+    const r = await post("/api/mines", {path: p});
+    $("minePath").value = "";
+    render(r.state);
+  }catch(e){ showErr(e); }
+});
+$("minePath").addEventListener("keydown", (e) => {
+  if(e.key === "Enter") $("btn-mine-add").click();
+});
+
+/* ------------------------------------------------ 启动 */
+
+// 3 秒轮询：只有状态真的变了才重绘，否则别打断用户手上的操作。
+let LAST_SIG = "";
+
+function signature(s){
+  return JSON.stringify([
+    s.counts, s.daemon, s.upload, s.settings,
+    (s.mines || []).map(m => [m.id, m.path, m.action, m.enabled, m.armed,
+                             m.live, m.triggers, m.note]),
+    ((s.events || [])[0] || {}).ts, (s.events || []).length,
+  ]);
+}
+
+async function refresh(){
+  if(BUSY) return;
+  BUSY = true;
+  try{
+    const s = await api("/api/state");
+    const cs = signature(s);
+    if(cs !== LAST_SIG){ LAST_SIG = cs; render(s); }
+  }catch(e){ showErr(e); }
+  finally{ BUSY = false; }
+}
+
+(async function boot(){
+  try{
+    const p = await api("/api/processes");
+    PROCS = p.items || [];
+  }catch(e){ PROCS = []; }
+  await refresh();
+  setInterval(refresh, 3000);
+})();
+</script>
+</body>
+</html>

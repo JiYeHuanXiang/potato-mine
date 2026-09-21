@@ -1,0 +1,31 @@
+{
+  "_comment": "Copy to mines.json and edit. Each entry below is one guarded directory = one mine. mines.json is never committed.",
+  "_field_guide": {
+    "settings.upload_monitor": "global: supervise netwatch.py record (outbound targets + upload volume)",
+    "settings.action": "default trigger action for new mines: warn | explode",
+    "settings.daemon_enabled": "last known state of the master switch (restored on console start)",
+    "mines[].path": "directory to guard",
+    "mines[].action": "trigger action for this mine: warn (record only) | explode (kill the moving process)",
+    "mines[].enabled": "this mine's on/off switch",
+    "mines[].id": "optional; derived deterministically from the path when omitted"
+  },
+  "settings": {
+    "upload_monitor": false,
+    "action": "explode",
+    "daemon_enabled": false
+  },
+  "mines": [
+    {
+      "path": "E:\my-project",
+      "action": "explode",
+      "enabled": true,
+      "note": "The watcher's own directory — the evidence."
+    },
+    {
+      "path": "E:\\another-project",
+      "action": "warn",
+      "enabled": false,
+      "note": "Watch-only: record forensics, never kill."
+    }
+  ]
+}
