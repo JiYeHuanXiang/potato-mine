@@ -1,0 +1,24 @@
+# Whitelist: only the project's own files are tracked.
+# Everything else in this working directory (investigation data, vendor
+# installers, capture traces, generated logs, local config) stays out of git.
+/*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/LICENSE
+!/netwatch.py
+!/potato_mine.py
+!/netwatch.cmd
+!/arm-potato.cmd
+!/stop-potato.cmd
+!/watch-config.example.json
+!/rules.example.txt
+!/exclusions.example.txt
+
+# ---- runtime artifacts (already excluded above; listed for clarity) ----
+# watch-config.json        local config: real process names and provider values
+# rules.txt, exclusions.txt
+# potato-mine.log, potato-mine-kills.txt, potato-mine.pid,
+# potato-mine-sensor.ps1, potato-mine-auditpol-state.json
+# watch-ips.json, watch-candidates.txt, watch-blockable.txt
+# *.jsonl, *.log, *.etl

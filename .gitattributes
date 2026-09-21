@@ -1,0 +1,10 @@
+# Normalize line endings: scripts stay LF (they run on any platform),
+# Windows batch files keep CRLF (cmd.exe requires it).
+* text=auto eol=lf
+*.py   text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.txt  text eol=lf
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+*.ps1  text eol=crlf

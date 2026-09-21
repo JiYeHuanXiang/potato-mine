@@ -1,0 +1,20 @@
+{
+  "_comment": "Copy this file to watch-config.json and edit. watch-config.json is never committed.",
+  "monitor_processes": [
+    "yourapp.exe"
+  ],
+  "host_apps": [
+    "yourapp.exe"
+  ],
+  "cloud_cidrs": [
+    "203.0.113.0/24"
+  ],
+  "cloud_domain_markers": [
+    "example-cloud.com",
+    "oss-cn-"
+  ],
+  "service_kinds": [
+    ["api.example.com", "Model API"],
+    ["logs.example.com", "Logging/telemetry"]
+  ]
+}

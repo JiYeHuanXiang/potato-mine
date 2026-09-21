@@ -1,0 +1,11 @@
+# netwatch exclusions (example)
+#
+# Destinations that are expected on this machine and should never be
+# reported as suspicious — your own infrastructure, VPN, update mirrors.
+# Format: one entry per line, same syntax as the rules file (domain pattern),
+# or a comment starting with '#'.
+
+# local development / tunnelling you run yourself
+*.your-vpn.example
+localhost
+127.0.0.1

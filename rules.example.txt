@@ -1,0 +1,17 @@
+# netwatch destination classification rules (example)
+#
+# Format:   category | domain-pattern | note
+#   A pattern without '*' also matches all subdomains.
+#   Decision order: exclusions > this table > cloud-provider fallback > unknown.
+#
+# Categories listed in the script's BENIGN_CATEGORIES are not flagged.
+# Anything else is reported as "needs review".
+
+# ---- documented services of the application you are studying ----
+Model API      | api.example.com        | provider API
+Model API      | *.example-cdn.com      | static assets
+
+# ---- things that would explain an upload: watch these closely ----
+Logging        | *.logsvc.example.net   | remote logging
+Object Storage | *.storage.example.net  | file upload target
+Analytics      | *.metrics.example.net  | telemetry
