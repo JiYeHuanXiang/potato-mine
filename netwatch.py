@@ -26,6 +26,7 @@ netwatch —— 目标应用出站流量监视器（Potato Mine 组件）
 """
 
 import argparse
+import bisect
 import ctypes
 import fnmatch
 import ipaddress
@@ -48,6 +49,12 @@ BENIGN_CATEGORIES = {
     "模型提供商", "厂商基础设施", "更新/镜像/CDN",
     "本机开发", "已知排除", "本地环回", "私有网络",
 }
+
+# 只标注、不处置的类别：广告与统计/追踪域名。它们在报告里单独成节，
+# 既不进"待查证"清单，也不进"可封禁"清单——广告流量本身不是外传证据，
+# 把它混进去只会淹没真正需要盯的目标。
+LABEL_ONLY_CATEGORIES = {"广告/统计"}
+AD_CATEGORY = "广告/统计"
 
 
 IS_WIN = sys.platform == "win32"
@@ -73,7 +80,12 @@ _WATCH_CFG = _load_watch_config()
 MONITOR_PROCESSES = [p.lower() for p in _WATCH_CFG.get("monitor_processes", [])]
 _MONI_NAMES = [p[:-4] if p.endswith(".exe") else p for p in MONITOR_PROCESSES]
 _CLOUD_CIDRS = list(_WATCH_CFG.get("cloud_cidrs", []))
+# 大块网段（几万条）放单独文件里，别把 watch-config.json 撑成不可读：
+#   "cloud_cidr_files": ["vendor-ranges.json"]
+_CLOUD_CIDR_FILES = [str(x) for x in _WATCH_CFG.get("cloud_cidr_files", [])]
 _CLOUD_MARKERS = list(_WATCH_CFG.get("cloud_domain_markers", []))
+_MARKER_GROUPS = [g for g in (_WATCH_CFG.get("marker_groups") or [])
+                  if isinstance(g, dict)]
 _SERVICE_KINDS = [(str(a), str(b)) for a, b in
                   _WATCH_CFG.get("service_kinds", [])]
 
@@ -131,14 +143,105 @@ def human_bytes(n):
     return f"{n:.1f} TB"
 
 
-# ------------------------------------------------- 云厂商识别（配置驱动）
+# ------------------------------------------------- 厂商识别（配置驱动）
 
-# 云厂商网段（来自 watch-config.json 的 cloud_cidrs；域名/SNI 侧优先）
-CLOUD_CIDRS_LIST = _CLOUD_CIDRS
-_CLOUD_NETS = [ipaddress.ip_network(c) for c in CLOUD_CIDRS_LIST]
+def _as_pair(item):
+    """标记项可以是 "a.com" 或 ["a.com", "某厂商"]，统一成 (标记, 标签)。"""
+    if isinstance(item, (list, tuple)) and len(item) >= 2:
+        return str(item[0]).lower(), str(item[1])
+    return str(item).lower(), ""
 
-# 云厂商域名特征（来自 cloud_domain_markers）
-CLOUD_DOMAIN_MARKERS_LIST = tuple(_CLOUD_MARKERS)
+
+def _load_cidr_files(names):
+    """从独立文件读大块网段。文件可以是 ["1.2.3.0/24", ...]，
+    也可以是 {"cidrs": [...]}。"""
+    out = []
+    for nm in names:
+        path = nm if os.path.isabs(nm) else os.path.join(HERE, nm)
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as ex:
+            # 静默跳过会让"网段一条没生效"变成看不见的坑
+            print(f"[WARN] 网段文件读不到，已跳过：{path}（{type(ex).__name__}）")
+            continue
+        if isinstance(data, dict):
+            data = data.get("cidrs", [])
+        if isinstance(data, list):
+            out.extend(str(x) for x in data)
+    return out
+
+
+# 可疑标记（进待查清单）与仅标注标记（广告/统计，单独成节）。
+# 兼容旧配置：没有 marker_groups 时，cloud_domain_markers 一律按"可疑"处理。
+_SUSPICIOUS_MARKERS = [_as_pair(x) for x in _CLOUD_MARKERS]
+_AD_MARKERS = []
+for _g in _MARKER_GROUPS:
+    _glabel = str(_g.get("label") or "")
+    _bucket = _SUSPICIOUS_MARKERS if _g.get("suspicious", True) else _AD_MARKERS
+    for _item in (_g.get("markers") or []):
+        _mk, _lb = _as_pair(_item)
+        if _mk:
+            _bucket.append((_mk, _lb or _glabel))
+
+SUSPICIOUS_MARKERS_LIST = tuple(_SUSPICIOUS_MARKERS)
+AD_MARKERS_LIST = tuple(_AD_MARKERS)
+
+
+def classify_vendor(name):
+    """给域名定性：返回 ("suspicious"|"ad"|None, 标签)。
+
+    两组标记都命中时取【更长的那个】——这样 pos.baidu.com 会按广告标记
+    定性，而不是被更宽泛的 baidu.com 吞成"云厂商"。
+    """
+    if not name:
+        return None, None
+    n = name.lower()
+    best_len, best_kind, best_label = -1, None, None
+    for pairs, kind in ((SUSPICIOUS_MARKERS_LIST, "suspicious"),
+                        (AD_MARKERS_LIST, "ad")):
+        for marker, label in pairs:
+            if marker in n and len(marker) > best_len:
+                best_len, best_kind, best_label = len(marker), kind, \
+                    (label or marker)
+    return best_kind, best_label
+
+
+def ad_kind(name):
+    """广告/统计/追踪域名 → 返回标签；不是则 None。只标注，不处置。"""
+    kind, label = classify_vendor(name)
+    return label if kind == "ad" else None
+
+
+# ---- 网段（兜底判据）----
+# 只作兜底：拿不到域名时才用 IP 判定（域名/SNI 侧优先）。
+# 大清单可达数万条，因此合并重叠区间后按上界二分，而不是逐条 in 判断。
+CLOUD_CIDRS_LIST = _CLOUD_CIDRS + _load_cidr_files(_CLOUD_CIDR_FILES)
+
+
+def _build_ranges(cidrs):
+    v4 = []
+    for c in cidrs:
+        try:
+            n = ipaddress.ip_network(str(c).strip(), strict=False)
+        except ValueError:
+            continue
+        if n.version != 4:
+            continue
+        v4.append((int(n.network_address), int(n.broadcast_address)))
+    v4.sort()
+    merged = []
+    for lo, hi in v4:
+        if merged and lo <= merged[-1][1] + 1:
+            if hi > merged[-1][1]:
+                merged[-1][1] = hi
+        else:
+            merged.append([lo, hi])
+    return merged
+
+
+_CLOUD_RANGES = _build_ranges(CLOUD_CIDRS_LIST)
+_CLOUD_STARTS = [r[0] for r in _CLOUD_RANGES]
 
 
 def is_cloud_ip(ip):
@@ -148,32 +251,48 @@ def is_cloud_ip(ip):
         return False
     if a.version != 4:
         return False
-    return any(a in n for n in _CLOUD_NETS)
+    i = int(a)
+    idx = bisect.bisect_right(_CLOUD_STARTS, i) - 1
+    return idx >= 0 and i <= _CLOUD_RANGES[idx][1]
 
 
 def is_cloud_name(name):
-    if not name:
-        return False
-    n = name.lower()
-    return any(m in n for m in CLOUD_DOMAIN_MARKERS_LIST)
+    return classify_vendor(name)[0] == "suspicious"
+
+
+# 产品类型关键词：刻意只描述"这是什么服务"，不写任何厂商名，
+# 这样换一家云、换一个存储产品名，判定依然成立。
+_STORAGE_HINTS = (
+    "oss", "cos.", "obs", "bos", "s3", "blob", "gcs", "storage", "bucket",
+    "ufile", "ks3", "nos", "qiniu", "bcebos", "oss-", "cos-", "imgix",
+)
+_LOG_HINTS = (
+    "log", "trace", "sls", "arms", "metric", "monitor", "analytics", "stat",
+    "collect", "beacon", "report", "sentry", "datadog", "newrelic", "umeng",
+    "crashlytics", "bugsnag", "telemetry",
+)
+_CDN_HINTS = ("cdn", "static", "img", "pic", "photo", "video", "vod",
+              "media", "edge", "cache")
+_UPDATE_HINTS = ("update", "upgrade", "download", "patch", "mirror",
+                 "maven", "npm", "pypi", "crates", "docker", "repo")
 
 
 def cloud_service_kind(name):
-    """给云厂商域名进一步定性——对象存储是文件上传最可能的落点，必须高亮。"""
+    """给可疑域名进一步定性——对象存储是文件上传最可能的落点，必须高亮。"""
     if not name:
         return None
     n = name.lower()
-    if "oss-" in n or ".oss." in n or re.search(r"(^|\.)oss[.-]", n):
-        return "OSS 对象存储"
-    if "log" in n or "xtrace" in n or "arms" in n or "trace" in n:
-        return "日志/链路遥测"
-    if "sls." in n:
-        return "日志服务"
-    for marker, note in _SERVICE_KINDS:
+    for marker, note in _SERVICE_KINDS:       # 配置里的已知服务优先
         if marker in n:
             return note
-    if "maven" in n or "npm" in n or "mirror" in n:
+    if any(h in n for h in _STORAGE_HINTS):
+        return "对象存储"
+    if any(h in n for h in _LOG_HINTS):
+        return "日志/链路遥测"
+    if any(h in n for h in _UPDATE_HINTS):
         return "软件源镜像"
+    if any(h in n for h in _CDN_HINTS):
+        return "CDN/静态资源"
     return "云厂商服务（未细分）"
 
 
@@ -458,9 +577,9 @@ def classify_dest(host_ip, names, rules, excl=None, port=None, prov=None):
     """对一个目的地址定性。返回 (display_name, category, note, flags)。"""
     flags = []
     name = None
-    # 优先挑非泛域名候选：优先出现云厂商特征的、再取最短
+    # 优先挑非泛域名候选：优先带厂商特征的（云/存储或广告标注）、再取最短
     if names:
-        al = [n for n in names if is_cloud_name(n)]
+        al = [n for n in names if is_cloud_name(n) or ad_kind(n)]
         pool = al or names
         name = sorted(pool, key=lambda s: (len(s), s))[0]
 
@@ -507,7 +626,7 @@ def classify_dest(host_ip, names, rules, excl=None, port=None, prov=None):
         flags.append("云厂商")
         if kind:
             flags.append(kind)
-        if kind == "OSS 对象存储":
+        if kind and "对象存储" in kind:
             flags.append("上传高危")
 
     cat, note = rules.match(name) if name else (None, "")
@@ -515,6 +634,11 @@ def classify_dest(host_ip, names, rules, excl=None, port=None, prov=None):
         return (name or host_ip, cat, note, flags)
     if cloud_ip or cloud_nm:
         return (name or host_ip, "云厂商-未在白名单", kind or "", flags)
+    # 广告/统计/追踪域名：单独成类、只标注。放在云厂商之后，免得把
+    # "跑在云上的广告服务"降级成只标注。
+    ad = ad_kind(name)
+    if ad:
+        return (name or host_ip, AD_CATEGORY, ad, flags + ["广告/统计"])
     if name:
         return (name, "未知", "", flags + ["未分类"])
     return (host_ip, "未知(无域名)", "", flags + ["未分类"])
@@ -1236,11 +1360,15 @@ def write_exports(store, rules, excl, outdir, probe=True):
     prov_ips = model_provider_ips(rules)
 
     candidates, blockable, skipped = [], [], []
-    cloud_rows, other_rows = [], []
+    cloud_rows, other_rows, ad_rows = [], [], []
     for ip, rec in sorted(store.destinations().items(),
                           key=lambda kv: kv[1].get("first_seen", "")):
         cat = rec.get("category", "未知")
         if cat in BENIGN_CATEGORIES:
+            continue
+        # 广告/统计只标注：既不进待查证清单，也不进可封禁清单。
+        if cat in LABEL_ONLY_CATEGORIES:
+            ad_rows.append((ip, rec))
             continue
         names = rec.get("names") or []
         disp = rec.get("display") or (names[0] if names else ip)
@@ -1318,6 +1446,21 @@ def write_exports(store, rules, excl, outdir, probe=True):
         f.write("=" * 78 + "\n")
         for t in cloud_rows:
             f.write(t + "\n\n")
+        f.write("=" * 78 + "\n")
+        f.write(f" 三、广告/统计目标（{len(ad_rows)} 个）——仅标注，不列入处置\n")
+        f.write("=" * 78 + "\n")
+        f.write("# 这些域名属于广告/统计/追踪基础设施，不算外传证据，也不会进入\n")
+        f.write("# watch-blockable.txt。列在这里只是让你看清应用都在跟谁打交道，\n")
+        f.write("# 想知道某条链路到底传了什么，还是要看上传字节数与抓包结果。\n")
+        if ad_rows:
+            for ip, rec in ad_rows:
+                names = rec.get("names") or []
+                disp = rec.get("display") or (names[0] if names else ip)
+                note = rec.get("note") or ""
+                f.write(f"  {ip:<18} {disp[:52]:<52} {note}\n")
+        else:
+            f.write("（无）\n")
+        f.write("\n")
         if skipped:
             f.write("\n# 以下目标经核验后【拒绝列入封禁名单】\n")
             for ip, disp, why in skipped:

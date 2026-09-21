@@ -1,20 +1,45 @@
 {
   "_comment": "Copy this file to watch-config.json and edit. watch-config.json is never committed.",
+
   "monitor_processes": [
     "yourapp.exe"
   ],
   "host_apps": [
     "yourapp.exe"
   ],
+
   "cloud_cidrs": [
     "203.0.113.0/24"
   ],
-  "cloud_domain_markers": [
-    "example-cloud.com",
-    "oss-cn-"
+  "_cloud_cidrs": "Optional. IP ranges are a FALLBACK only: they decide a destination's nature when no hostname could be resolved. Domain/SNI markers do the real work, so a handful of ranges here is usually enough.",
+
+  "cloud_cidr_files": [
+    "vendor-ranges.json"
   ],
+  "_cloud_cidr_files": "Optional. Extra files holding large CIDR lists, so a multi-thousand-range list does not turn this file into an unreadable wall. Each file is either [\"1.2.3.0/24\", ...] or {\"cidrs\": [...]}. Ranges are merged at load and looked up by binary search, so tens of thousands of entries stay cheap.",
+
+  "marker_groups": [
+    {
+      "label": "cloud / object storage / CDN",
+      "suspicious": true,
+      "markers": [
+        ["example-cloud.com", "example cloud"],
+        ["oss-", "object storage (marker = any substring)"]
+      ]
+    },
+    {
+      "label": "ads / analytics / tracking",
+      "suspicious": false,
+      "markers": [
+        ["example-ads.example", "example ad network"]
+      ]
+    }
+  ],
+  "_marker_groups": "Groups of domain markers. A 'suspicious: true' group is treated as possible exfiltration destinations and lands in watch-candidates.txt / watch-blockable.txt. A 'suspicious: false' group is labelled only: it gets its own section in the report and never enters the block list. A hostname is classified by its LONGEST matching marker, so a specific ad marker beats a broad provider marker. Backwards compatible: a flat \"cloud_domain_markers\": [\"a.com\", ...] behaves like one suspicious group.",
+
   "service_kinds": [
     ["api.example.com", "Model API"],
     ["logs.example.com", "Logging/telemetry"]
-  ]
+  ],
+  "_service_kinds": "Optional. [[substring, label]] pairs that name a destination you already recognise. Checked before the generic storage / log / CDN keyword heuristics."
 }

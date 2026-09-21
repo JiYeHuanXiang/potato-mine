@@ -13,6 +13,7 @@
 !/webui.html
 !/webui.cmd
 !/test_mine_core.py
+!/test_netwatch_classify.py
 !/netwatch.cmd
 !/arm-potato.cmd
 !/stop-potato.cmd

@@ -52,8 +52,20 @@ Then edit `watch-config.json`:
 {
   "monitor_processes": ["yourapp.exe"],
   "host_apps": ["yourapp.exe"],
+  "marker_groups": [
+    {
+      "label": "cloud / object storage / CDN",
+      "suspicious": true,
+      "markers": [["example-cloud.com", "example cloud"], ["oss-", "object storage"]]
+    },
+    {
+      "label": "ads / analytics / tracking",
+      "suspicious": false,
+      "markers": [["example-ads.example", "example ad network"]]
+    }
+  ],
   "cloud_cidrs": ["203.0.113.0/24"],
-  "cloud_domain_markers": ["example-cloud.com"]
+  "cloud_cidr_files": ["vendor-ranges.json"]
 }
 ```
 
@@ -61,12 +73,21 @@ Then edit `watch-config.json`:
 |---|---|
 | `monitor_processes` | Executable names whose connections `netwatch` attributes. Electron apps spawn many child processes with the same name — all are included. |
 | `host_apps` | Programs you use *to do your analysis* (your IDE, the app under study, remote-desktop tools). Processes in the mine's "host app" trees may **read** the tool directory (it logs a warning) but are never killed for it. Their copy operations are still killed. |
-| `cloud_cidrs` | Optional. IP ranges belonging to the cloud provider you care about, used as a fallback when a connection's hostname is unknown. |
-| `cloud_domain_markers` | Optional. Domain substrings that identify that provider (e.g. object-storage hostnames). |
+| `marker_groups` | Domain markers, grouped and labelled. `suspicious: true` groups are treated as possible exfiltration destinations and land in `watch-candidates.txt` / `watch-blockable.txt`; `suspicious: false` groups are *labelled only* — they get their own section in the report and never enter the block list. That second kind is for ad/analytics/tracking infrastructure: worth seeing, not worth blocking. A hostname is classified by its **longest** matching marker, so a specific ad marker beats a broad provider marker. |
+| `cloud_cidrs` | Optional. IP ranges used as a **fallback** — they only decide a destination's nature when no hostname could be resolved. Domain markers do the real work. |
+| `cloud_cidr_files` | Optional. Extra files holding large CIDR lists, so a multi-thousand-range list does not turn this file into a wall. Ranges are merged at load and looked up by binary search, so tens of thousands of entries stay cheap. |
+| `cloud_domain_markers` | Legacy flat list. Still works — it behaves like one `suspicious: true` group. |
 | `service_kinds` | Optional. `[["substring", "label"]]` pairs to name known services in reports. |
 
 Both tools load this file from their own directory. Nothing vendor-specific is
-built into the code.
+built into the code — and the lists themselves are yours to fill in: only the
+schema ships with the repo.
+
+**Where the IP ranges come from.** Providers with an official list (AWS,
+Google, Cloudflare) publish machine-readable data; for the rest, announced
+prefixes can be pulled per ASN from RIPEstat. `vendor-fetch.py` (kept locally,
+alongside your filled-in `vendors.local.json`) generates `vendor-ranges.json`
+in that shape — rerun it every so often, since ranges drift.
 
 ### 2. Watch traffic
 
@@ -226,6 +247,8 @@ This is a defensive tool, so it is built to be boring about worst cases.
 
 ```
 netwatch.py                  outbound-connection watcher
+test_netwatch_classify.py    regression tests for destination classification
+test_mine_core.py            regression tests for the mine engine
 potato_mine.py               self-protection mine (CLI)
 mine_core.py                 shared engine: mines, judgement, forensics
 webui.py                     web console backend (stdlib HTTP + JSON API)
@@ -288,6 +311,11 @@ Creation）与 4688 命令行记录策略，并给守护目录加上 `Everyone:R
 - 复制 `watch-config.example.json` 为 `watch-config.json`，填入要监视的
   可执行文件名（`monitor_processes`）与你日常分析的宿主应用
   （`host_apps`，其读取只告警不击杀）。
+- 用 `marker_groups` 填厂商域名特征：`suspicious: true` 的组会进
+  「待查证/可封禁」清单；`suspicious: false` 的组**只标注**（报告里单独
+  成节，永不进封禁清单）——广告/统计/追踪类域名放这一组最合适。
+- IP 段只是**兜底**：只有拿不到域名时才用它判断。大清单放
+  `cloud_cidr_files` 指向的独立文件里，加载时会合并区间、查询走二分。
 - 复制 `mines.example.json` 为 `mines.json`，列出要守护的目录（每项一个
   地雷，含 `action` 与 `enabled`）。没有 `mines.json` 时沿用旧行为：
   守护脚本所在目录。
