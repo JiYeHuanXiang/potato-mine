@@ -93,6 +93,11 @@
   .dot{display:inline-block;width:7px;height:7px;border-radius:50%;
        background:#6c6e58;margin-right:6px}
   .dot.on{background:var(--ok)} .dot.off{background:#6c6e58}
+  .check{display:flex;gap:10px;padding:6px 0;border-bottom:1px solid #232619}
+  .check:last-child{border-bottom:0}
+  .check .st{flex:0 0 46px;font-family:Consolas,monospace;font-size:12px}
+  .check .st.ok{color:var(--ok)} .check .st.bad{color:var(--bad)}
+  .check .nm{flex:0 0 210px;color:var(--dim)}
 </style>
 </head>
 <body>
@@ -102,6 +107,7 @@
     <div class="sub" id="hdr-sub">加载中…</div>
   </div>
   <div class="spacer"></div>
+  <span class="badge gold" title="版本">V0.01</span>
   <div id="hdr-admin"></div>
   <button id="btn-daemon" class="primary">守护总开关</button>
 </header>
@@ -109,7 +115,7 @@
 <main>
   <!-- ------------------------------------------------ 全局设置 -->
   <section class="card">
-    <h2>全局设置<span class="hint">对所有地雷生效</span></h2>
+    <h2>全局设置<span class="hint">主进程 / 宿主应用 / 上传监视；动作是新增地雷的默认值</span></h2>
 
     <label class="lbl">监视的主进程（被观察的应用，写回 watch-config.json）</label>
     <div class="row">
@@ -124,11 +130,23 @@
       <button id="btn-proc-add">添加</button>
     </div>
 
-    <label class="lbl">可疑上传行为监视（托管 netwatch.py record）</label>
+    <label class="lbl">宿主应用（只告警、永不击杀；独立可执行文件执行的复制仍会被拦下）</label>
+    <div class="chips" id="hostChips"></div>
+    <div class="row">
+      <input type="text" id="hostCustom" placeholder="输入可执行文件名，如 code.exe">
+      <button id="btn-host-add">添加宿主应用</button>
+    </div>
+    <div class="note">被观察的应用通常也应列在这里：它的读取只留下告警，
+      不会因为读工具目录而被击杀。由另一个可执行文件执行的复制/上传仍会被拦下；
+      宿主应用自己进程内的复制只告警。</div>
+
+    <label class="lbl">可疑上传行为监视（托管 netwatch.py record，记录出站目标）</label>
     <div class="row">
       <button class="switch" id="sw-upload" role="switch"></button>
       <span id="upload-state" class="muted">—</span>
     </div>
+    <div class="note">这个开关累积目标应用联系过的域名/IP，并在新目标出现时告警。
+      上传字节数需要 <code>netwatch.py deep</code> 抓包，不在这个长期模式里统计。</div>
 
     <label class="lbl">触发地雷后的行为</label>
     <div class="row">
@@ -158,6 +176,16 @@
     <div class="note" id="mine-note" style="margin-top:12px"></div>
   </section>
 
+  <!-- ------------------------------------------------ 体检 -->
+  <section class="card">
+    <h2>体检<span class="hint">权限 / 审计策略 / Security 日志 / 布雷状态</span></h2>
+    <div class="row">
+      <button id="btn-checks">运行体检</button>
+      <span id="checks-summary" class="muted">—</span>
+    </div>
+    <div id="checkList"></div>
+  </section>
+
   <!-- ------------------------------------------------ 事件 -->
   <section class="card">
     <h2>事件与取证<span class="hint" id="ev-file">—</span></h2>
@@ -175,6 +203,7 @@
 const $ = (id) => document.getElementById(id);
 let PROCS = [];
 let SELECTED = [];
+let HOSTS = [];
 let EVKIND = "";
 let BUSY = false;
 
@@ -205,10 +234,12 @@ function renderHeader(s){
     ? '<span class="badge ok">管理员</span>'
     : '<span class="badge bad">非管理员 · 布雷/运行被拒绝</span>';
   const d = s.daemon;
+  const phase = (!d.running && d.phase && d.phase !== "未启动")
+    ? ` · ${esc(d.phase)}` : "";
   const bit = d.running
     ? `<span class="dot on"></span>守护运行中 · PID ${d.pid}` +
       (d.since ? ` · 自 ${esc(d.since)}` : "")
-    : `<span class="dot off"></span>守护未运行`;
+    : `<span class="dot off"></span>守护未运行${phase}`;
   const ext = (s.external||[]).length
     ? ` · 另有命令行实例 ${s.external.join(",")}`
     : "";
@@ -254,10 +285,31 @@ function renderChips(){
   });
 }
 
+function renderHostChips(){
+  if(!HOSTS.length){
+    $("hostChips").innerHTML = '<span class="muted">（未配置宿主应用）</span>';
+    return;
+  }
+  $("hostChips").innerHTML = HOSTS
+    .map(n => `<span class="chip" data-host="${esc(n)}">${esc(n)}</span>`)
+    .join("");
+  $("hostChips").querySelectorAll(".chip").forEach(el => {
+    el.addEventListener("click", async () => {
+      const next = HOSTS.filter(x => x !== el.dataset.host);
+      try{
+        const s = await post("/api/settings", {host_apps: next});
+        render(s);
+      }catch(e){ showErr(e); }
+    });
+  });
+}
+
 function renderSettings(s){
   const st = s.settings;
   SELECTED = st.monitor_processes.slice();
+  HOSTS = (st.host_apps || []).slice();
   renderChips();
+  renderHostChips();
   renderProcessPicker();
 
   const sw = $("sw-upload");
@@ -270,15 +322,16 @@ function renderSettings(s){
           (u.since ? ` · 自 ${esc(u.since)}` : "") + `</span>`
         : `<span class="badge bad">已启用但未运行</span> ` +
           (u.error ? esc(u.error) : ""))
-    : '<span class="muted">已关闭（不累积出站目标与上传量）</span>';
+    : '<span class="muted">已关闭（不累积出站目标）</span>';
 
   $("seg-action").querySelectorAll("button").forEach(b => {
     b.classList.toggle("on", b.dataset.action === st.action);
   });
-  $("action-note").innerHTML = st.action === "explode"
+  $("action-note").innerHTML = (st.action === "explode"
     ? "爆炸：地雷炸响时终止【执行搬运的那一个进程】（taskkill /F /PID，不带 /T）。" +
       "不杀父进程、不连带子进程，取证全量落盘。"
-    : "警告：地雷炸响时只记全档（进程名/PID/父进程/命令行/文件），不终止任何进程。";
+    : "警告：地雷炸响时只记全档（进程名/PID/父进程/命令行/文件），不终止任何进程。")
+    + " 全局动作只作用于新增地雷；要改已有地雷请点「应用到全部地雷」。";
 }
 
 function renderMines(s){
@@ -295,7 +348,9 @@ function renderMines(s){
         ? '<span class="badge bad">目录缺失</span>'
         : (m.live ? '<span class="badge ok">运行中</span>'
                   : (m.armed ? '<span class="badge warn">已布雷·守护未运行</span>'
-                             : '<span class="badge">已停用</span>'));
+                             : (m.enabled
+                                ? '<span class="badge warn">未布雷·等待守护</span>'
+                                : '<span class="badge">已停用</span>')));
       const act = m.action === "warn" ? "warn" : "explode";
       return `<tr data-id="${esc(m.id)}">
         <td class="path">${esc(m.path)} ${badge}
@@ -346,7 +401,7 @@ function renderEvents(s){
     $("evList").innerHTML = '<div class="empty">暂无事件</div>';
     return;
   }
-  $("evList").innerHTML = items.slice(0, 60).map(e => {
+  $("evList").innerHTML = items.slice(0, 100).map(e => {
     const bits = [];
     if(e.name) bits.push(esc(e.name));
     if(e.pid != null) bits.push("pid " + esc(e.pid));
@@ -378,7 +433,12 @@ function render(s){
   if(!s.admin) hint.push("非管理员：布雷与运行会被拒绝。");
   if(!s.settings.monitor_processes.length) hint.push("未选择主进程：上传监视无法归因。");
   if((s.external||[]).length) hint.push("有命令行实例在跑，控制台不会重复托管。");
-  if(!s.daemon.running) hint.push("守护未运行：开关已保存，启动守护后生效。");
+  if(s.daemon.error) hint.push("守护错误：" + s.daemon.error);
+  else if(!s.daemon.running && s.daemon.phase &&
+          !["未启动","运行中"].includes(s.daemon.phase))
+    hint.push("守护状态：" + s.daemon.phase);
+  if(!s.daemon.running)
+    hint.push("守护未运行：地雷开关可能已布雷，但没人读取事件；启动守护后才真正有防护。");
   $("mine-note").innerHTML = hint.length
     ? '<b>提示</b>：' + hint.map(esc).join(" ") : "";
   $("mine-note").style.display = hint.length ? "block" : "none";
@@ -448,6 +508,26 @@ $("btn-proc-add").addEventListener("click", async () => {
   }catch(e){ showErr(e); }
 });
 
+$("btn-host-add").addEventListener("click", async () => {
+  const v = $("hostCustom").value.trim().toLowerCase();
+  if(!v) return;
+  if(!v.endsWith(".exe")) return showErr(new Error("请填可执行文件名，如 code.exe"));
+  if(HOSTS.includes(v)) return;
+  $("hostCustom").value = "";
+  try{
+    const s = await post("/api/settings", {host_apps: HOSTS.concat([v])});
+    render(s);
+  }catch(e){ showErr(e); }
+});
+
+$("hostCustom").addEventListener("keydown", (e) => {
+  if(e.key === "Enter") $("btn-host-add").click();
+});
+
+$("procCustom").addEventListener("keydown", (e) => {
+  if(e.key === "Enter") $("btn-proc-add").click();
+});
+
 $("btn-proc-refresh").addEventListener("click", async () => {
   const r = await api("/api/processes?refresh=1");
   PROCS = r.items || [];
@@ -468,6 +548,25 @@ $("btn-mine-add").addEventListener("click", async () => {
 });
 $("minePath").addEventListener("keydown", (e) => {
   if(e.key === "Enter") $("btn-mine-add").click();
+});
+
+$("btn-checks").addEventListener("click", async () => {
+  const b = $("btn-checks");
+  b.disabled = true;
+  $("checks-summary").textContent = "检查中…（要查询 SACL，可能需要几秒）";
+  try{
+    const r = await api("/api/checks");
+    const items = r.items || [];
+    const bad = items.filter(x => !x.ok).length;
+    $("checks-summary").textContent = bad
+      ? `${items.length} 项，${bad} 项需要处理`
+      : `${items.length} 项全部通过`;
+    $("checkList").innerHTML = items.map(x => `<div class="check">
+      <span class="st ${x.ok?'ok':'bad'}">${x.ok?'OK':'FAIL'}</span>
+      <span class="nm">${esc(x.name)}</span>
+      <span>${esc(x.detail)}</span></div>`).join("");
+  }catch(e){ showErr(e); }
+  finally{ b.disabled = false; }
 });
 
 /* ------------------------------------------------ 启动 */
@@ -494,6 +593,16 @@ async function refresh(){
   }catch(e){ showErr(e); }
   finally{ BUSY = false; }
 }
+
+$("ev-filters").querySelectorAll("button").forEach(b => {
+  b.addEventListener("click", () => {
+    EVKIND = b.dataset.kind || "";
+    $("ev-filters").querySelectorAll("button").forEach(x =>
+      x.classList.toggle("on", x === b));
+    LAST_SIG = "";          // 强制下一次刷新重绘，否则签名没变会跳过
+    refresh();
+  });
+});
 
 (async function boot(){
   try{

@@ -12,7 +12,7 @@ netwatch —— 目标应用出站流量监视器（Potato Mine 组件）
   2. 严格【按进程归因】—— 只有被监控应用进程树（含 Electron 子进程）的连接算数。
      其他进程（svchost、系统服务等）与云厂商的连接单独列出并标注"已排除"。
   3. 【SNI 铁证】—— 从 TLS ClientHello 中提取真实域名，不依赖 DNS，无法被伪造。
-  4. 【上传字节数】—— 按目标域名统计 目标应用 实际上传了多少数据。
+  4. 【上传字节数】—— deep 模式按目标域名统计 目标应用 实际上传了多少数据。
 
 模式：
   watch    免管理员。轮询连接表 + DNS 缓存，实时打印新出现的目的地。
@@ -65,7 +65,9 @@ DEFAULT_RULES = os.path.join(HERE, "rules.txt")
 DEFAULT_EXCLUSIONS = os.path.join(HERE, "exclusions.txt")
 
 # ---- watch-config.json：本仓库不内置任何具体软件/厂商特征 ----
-WATCH_CONFIG_PATH = os.path.join(HERE, "watch-config.json")
+# NETWATCH_CONFIG 供测试/多实例指向另一份配置；默认仍是脚本目录。
+WATCH_CONFIG_PATH = (os.environ.get("NETWATCH_CONFIG")
+                     or os.path.join(HERE, "watch-config.json"))
 
 
 def _load_watch_config():
@@ -769,7 +771,11 @@ def l4_extract(frame, orig_len):
         eth_type = struct.unpack(">H", frame[off + 2 : off + 4])[0]
         off += 4
     if eth_type == 0x0800:
+        if len(frame) < off + 20:
+            return None
         ihl = (frame[off] & 0x0F) * 4
+        if ihl < 20 or len(frame) < off + ihl:
+            return None
         proto = frame[off + 9]
         src = ".".join(str(b) for b in frame[off + 12 : off + 16])
         dst = ".".join(str(b) for b in frame[off + 16 : off + 20])
@@ -794,6 +800,8 @@ def l4_extract(frame, orig_len):
             return None
         sport, dport = struct.unpack(">HH", frame[off : off + 4])
         doff = (frame[off + 12] >> 4) * 4
+        if doff < 20 or len(frame) < off + doff:
+            return None
         pstart = off + doff
         pbytes = max(0, orig_len - pstart)
         return (src, dst, sport, dport, "TCP", frame[pstart:], pbytes)
@@ -956,6 +964,10 @@ class Monitor:
         self.refresh_dns(interval=getattr(self, "dns_interval", 5))
         self._reenrich()
         rows = netstat_connections()
+        # 监听端口属于“入站”一侧：接受进来的连接本地端口 = 监听端口。
+        # 只统计目标应用主动发起的连接，避免把入站会话算成上传。
+        listening = {(pid, lp) for _p, _lh, lp, _rh, _rp, st, pid in rows
+                     if st.upper().startswith("LISTEN")}
         new = []
 
         for _proto, lh, lp, rh, rp, state, pid in rows:
@@ -963,6 +975,8 @@ class Monitor:
                 continue
             if state.upper().startswith("LISTEN"):
                 continue
+            if (pid, lp) in listening:
+                continue              # 本地端口在监听 = 入站连接，不是出站
             is_z = pid in self.procs.pids
 
             if is_z:
@@ -1313,15 +1327,15 @@ class Store:
 
 
 def model_provider_ips(rules, prov=None):
-    if prov is not None:
-        prov.refresh(force=True)
-        return set(prov.map.keys())
     """解析规则表里所有「模型提供商」域名，返回其当前 IP 集合。
 
     这是导出封禁名单前的最后一道安全闸：封禁列表以 IP 形式交给防火墙/杀软，
     一旦把模型 API 的 IP 写进去，目标应用 就彻底不能用了。所以导出时
     必须拿实时的解析结果做一次交叉核对，命中即剔除。
     """
+    if prov is not None:
+        prov.refresh(force=True)
+        return set(prov.map.keys())
     ips = set()
     for cat, pat, _note in rules.entries:
         if cat != "模型提供商":
@@ -1792,6 +1806,7 @@ def cmd_record(args, rules, excl):
     except KeyboardInterrupt:
         print(f"\n[{ts()}] 收到中断，正在保存…")
 
+    m.close()
     store.save()
     cand, blockable, skipped = write_exports(store, rules, excl, args.outdir)
 
@@ -1890,6 +1905,9 @@ def cmd_avlog(args, rules, excl):
     if err:
         print(f"  ❌ {err}")
         return 1
+    if not events:
+        print("  ❌ 日志里没有任何事件，无法审查")
+        return 1
 
     ts_list = [e[0] for e in events]
     rng = (datetime.fromtimestamp(min(ts_list)), datetime.fromtimestamp(max(ts_list)))
@@ -1930,10 +1948,17 @@ def cmd_avlog(args, rules, excl):
     by_proc = av_facts(events, excl)
 
     def _is_target(proc):
-        pl = proc.lower()
-        if pl.endswith("\\targets.exe"):
-            return True
-        return "\\programs\\targets\\" in pl
+        """日志里的进程路径是否属于配置中的被观察应用。
+
+        这里必须用 monitor_processes，不能写死某个应用名——否则换一个
+        被观察对象，avlog 就永远只认旧名字。
+        """
+        pl = proc.lower().replace("/", "\\").strip('"')
+        base = os.path.basename(pl)
+        for name in MONITOR_PROCESSES:
+            if base == name or pl == name or pl.endswith("\\" + name):
+                return True
+        return False
 
     targets = {p: v for p, v in by_proc.items() if _is_target(p)}
     store = Store(os.path.join(args.outdir, "watch-ips.json"))
@@ -1968,7 +1993,7 @@ def cmd_avlog(args, rules, excl):
                             rules, excl, established=True)
         store.save()
         write_exports(store, rules, excl, args.outdir, probe=False)
-        print(f"     已写入 targets-ips.json 并刷新 watch-blockable.txt")
+        print(f"     已写入 watch-ips.json 并刷新 watch-blockable.txt")
     else:
         print()
         print("  ✅ 日志里没有本地抓包未发现的目标")

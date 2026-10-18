@@ -34,6 +34,7 @@ import time
 import webbrowser
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 import mine_core as mc
 
@@ -166,6 +167,7 @@ def stop_daemon():
             return True, "守护未在运行"
         sup, SUP = SUP, None
         sup.stop()                # run() 的 finally 会排雷并清 pid 文件
+        restored = mc.restore_cmd_policy()
         try:
             REG.load()
             REG.settings["daemon_enabled"] = False
@@ -176,7 +178,7 @@ def stop_daemon():
             m.armed = False
         _ARMED_CACHE["map"] = {m.id: False for m in REG.mines}
         _ARMED_CACHE["ts"] = time.time()
-        return True, "守护已停止并排雷"
+        return True, f"守护已停止并排雷（4688 策略：{restored}）"
 
 
 def reconcile():
@@ -216,6 +218,9 @@ def _norm_names(v):
 
 def apply_settings(payload):
     cfg = mc.load_config()
+    if mc.CONFIG_ERROR:
+        raise ValueError("watch-config.json 解析失败，请先修复："
+                         + mc.CONFIG_ERROR)
     changed_proc = False
     for key in ("monitor_processes", "host_apps"):
         vals = _norm_names(payload.get(key))
@@ -227,6 +232,9 @@ def apply_settings(payload):
     REG.load()                       # 外部可能直接改过 mines.json
     for key in ("upload_monitor", "action"):
         if payload.get(key) is not None:
+            if key == "action" and payload[key] not in (
+                    mc.ACTION_WARN, mc.ACTION_EXPLODE):
+                raise ValueError("未知的触发动作")
             REG.settings[key] = payload[key]
     if payload.get("apply_action_all"):
         act = payload.get("action") or REG.settings.get("action")
@@ -317,7 +325,7 @@ def _mines_view(watched):
     return mines
 
 
-def collect_state(events_n=60):
+def collect_state(events_n=240):
     events = tail_events(events_n)
     ext = external_instances()
     sup_running = SUP is not None and SUP.is_alive() and SUP.running
@@ -348,7 +356,7 @@ def collect_state(events_n=60):
 # ---------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "PotatoMine/1.0"
+    server_version = "PotatoMine/0.01"
 
     def log_message(self, fmt, *args):
         if VERBOSE:
@@ -356,6 +364,32 @@ class Handler(BaseHTTPRequestHandler):
                                             fmt % args))
 
     # ---- helpers ----
+    def _origin_ok(self):
+        """拒绝跨站写入。
+
+        控制台能终止进程，而任何网页都能向 127.0.0.1 发简单 POST。
+        同源请求的 Origin 主机必须与 Host 头一致（或为本机回环）。
+        curl 等不带 Origin 的本地调用仍然允许。
+        """
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        try:
+            o = urlsplit(origin)
+        except ValueError:
+            return False
+        if o.scheme not in ("http", "https"):
+            return False
+        host = (o.hostname or "").lower()
+        if host in ("127.0.0.1", "localhost", "::1"):
+            return True
+        host_hdr = (self.headers.get("Host") or "").strip().lower()
+        if host_hdr.startswith("["):
+            host_hdr = host_hdr[1:host_hdr.find("]")] if "]" in host_hdr else host_hdr
+        elif ":" in host_hdr:
+            host_hdr = host_hdr.rsplit(":", 1)[0]
+        return bool(host) and host == host_hdr
+
     def _send(self, code, body, ctype="application/json; charset=utf-8"):
         if isinstance(body, str):
             body = body.encode("utf-8")
@@ -421,6 +455,8 @@ class Handler(BaseHTTPRequestHandler):
     # ---- POST ----
     def do_POST(self):
         path = self.path.split("?", 1)[0]
+        if not self._origin_ok():
+            return self._err("拒绝跨站请求（Origin 不是本机控制台）", 403)
         try:
             if path == "/api/daemon":
                 ok, msg = start_daemon() \
@@ -459,12 +495,27 @@ class Handler(BaseHTTPRequestHandler):
                     mine.action = payload["action"]
                 if payload.get("enabled") is not None:
                     mine.enabled = bool(payload["enabled"])
-                if payload.get("path"):
-                    mine.path = os.path.abspath(str(payload["path"]))
+                new_path = str(payload.get("path") or "").strip()
+                if new_path:
+                    new_abs = os.path.abspath(os.path.join(HERE, new_path))
+                    if not os.path.isdir(new_abs):
+                        return self._err("守护目录不存在")
+                    new_key = mc.norm_path(new_abs)
+                    if new_key != mine.key:
+                        if any(x is not mine and x.key == new_key
+                               for x in REG.mines):
+                            return self._err("该目录已在守护清单中")
+                        old_path = mine.path
+                        try:
+                            if mc.sacl_present(old_path)[0]:
+                                mc.disarm_sacl(old_path)
+                        except Exception:
+                            pass
+                        mine.path = new_abs
                 REG.save()
                 reconcile()
-                mc.log("MINE_UPDATE", id=mine.id, action=mine.action,
-                       enabled=mine.enabled)
+                mc.log("MINE_UPDATE", id=mine.id, path=mine.path,
+                       action=mine.action, enabled=mine.enabled)
                 return self._json({"ok": True, "state": collect_state()})
 
             return self._err("not found", 404)
@@ -474,6 +525,8 @@ class Handler(BaseHTTPRequestHandler):
     # ---- DELETE ----
     def do_DELETE(self):
         path = self.path.split("?", 1)[0]
+        if not self._origin_ok():
+            return self._err("拒绝跨站请求（Origin 不是本机控制台）", 403)
         if path.startswith("/api/mines/"):
             try:
                 mine = REG.remove(path[len("/api/mines/"):])

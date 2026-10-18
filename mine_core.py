@@ -13,7 +13,8 @@ mine_core.py —— Potato Mine 引擎（多守护目录 / 可配置触发动作
   守护目录 B  [开关]   触发动作: 爆炸
 
 「监视的主进程」（watch-config.json 的 monitor_processes）是被观察的应用；
-「监控可疑上传行为」托管 netwatch.py record 子进程（累积出站目标与上传量）；
+「监控可疑上传行为」托管 netwatch.py record 子进程（累积出站目标/域名与
+是否建连；上传字节数需要 netwatch.py deep 抓包）；
 「触发后的动作」决定地雷炸响时做什么：
     警告 (warn)    —— 只记全档，不终止任何进程
     爆炸 (explode) —— 终止执行搬运的那一个进程
@@ -38,6 +39,7 @@ Layer B 出生检查（4688）：新进程的命令行同时满足
 
 import ctypes
 from ctypes import wintypes
+import ipaddress
 import json
 import os
 import queue
@@ -47,6 +49,7 @@ import sys
 import threading
 import time
 from datetime import datetime
+from urllib.parse import urlsplit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WATCH_CONFIG = os.path.join(HERE, "watch-config.json")
@@ -102,15 +105,27 @@ SHELL_NAMES = {"bash.exe", "sh.exe", "cmd.exe", "powershell.exe", "pwsh.exe",
 
 COPY_VERBS = re.compile(
     r"(?i)\b(copy-item|compress-archive|move-item|expand-archive|robocopy|"
-    r"xcopy|copy|cp|mv|move|tar|7z|7za|zip|rar|scp|rsync|curl|wget|"
+    r"xcopy|copy|cp|mv|move|tar|7z|7za|zip|rar|scp|rsync|"
     r"uploadfile|shutil\.copy|copyfile|copytree|make_archive|"
-    r"--upload-file|-T\s|-F\s|--form\b|-f\s|put_object|upload_file)"
+    r"put_object|upload_file)\b"
+)
+# curl/wget 本身只是 HTTP 客户端，不是“搬运”：只有带上传参数时才算。
+# 否则 `cd 守护目录 && curl http://127.0.0.1:8756/api/state` 会被当成外传。
+# 这里刻意区分大小写：-T / -F 是 curl 的上传开关，-t / -f 常是别的工具的参数。
+UPLOAD_FLAGS = re.compile(
+    r"(?-i:(?:^|\s)(?:-T\s|-F\s|--upload-file\b|--form\b|--post-file\b|"
+    r"--data(?:-binary|-ascii|-raw|-urlencode)?\s+@|--json\s+@|-d\s+@))"
 )
 PATHISH = re.compile(r'(?:"([^"]+)"|(\S+))')
 _ABS_WIN = re.compile(r"^[A-Za-z]:[\\/]|^\\\\")
 # Git-Bash 风格的根路径 /d/backup 算目的地；/E、/Y 这类开关不算。
 # 判据：第一个路径段长度 >= 2 —— 命令行开关几乎都是单字母。
 _ABS_POSIX_ROOTED = re.compile(r"^/([^/]{2,})(/|$)")
+
+
+def has_copy_semantics(cmd):
+    """命令行是否包含复制/打包/上传语义。"""
+    return bool(COPY_VERBS.search(cmd) or UPLOAD_FLAGS.search(cmd))
 
 
 def is_abs_path(tok):
@@ -123,6 +138,28 @@ def is_abs_path(tok):
     if _ABS_WIN.match(tok):
         return True
     return bool(_ABS_POSIX_ROOTED.match(tok))
+
+
+def is_loopback_url(tok):
+    """http(s)://127.0.0.1、localhost、[::1] 不是“目录之外的目的地”。
+
+    它们指向本机服务（典型是控制台自己的 API）。把访问本机 API 当成
+    外传会制造真实的误杀：日志里就出现过 `cd 守护目录 && curl 127.0.0.1`
+    被 Layer B 击杀。
+    """
+    try:
+        u = urlsplit(tok)
+        host = (u.hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    if u.scheme.lower() not in ("http", "https", "ftp", "sftp"):
+        return False
+    if host in ("localhost", "localhost.localdomain"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 PS_UTF8 = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
 
@@ -177,14 +214,22 @@ def ps_run(cmd, timeout=60):
     return r.returncode, r.stdout or "", r.stderr or ""
 
 
+CONFIG_ERROR = ""
+
+
 def load_config():
+    global CONFIG_ERROR
     try:
         with open(WATCH_CONFIG, encoding="utf-8") as f:
-            return json.load(f)
+            cfg = json.load(f)
     except FileNotFoundError:
+        CONFIG_ERROR = ""
         return {}
-    except Exception:
+    except Exception as ex:
+        CONFIG_ERROR = f"{type(ex).__name__}: {ex}"
         return {}
+    CONFIG_ERROR = ""
+    return cfg
 
 
 def save_config(cfg):
@@ -331,12 +376,18 @@ def disarm_all(mines):
 
 
 def read_cmd_policy():
-    """读 4688 命令行记录策略当前值；缺失返回 None。"""
+    """读 4688 命令行记录策略当前值。
+
+    缺失返回 "MISSING"；PowerShell 读取失败返回 "UNKNOWN"（此时不要记录
+    “原值”，否则排雷时可能误删一个其实存在的策略）。
+    """
     rc, out, _ = ps_run(
         f"$p='{CMD_POLICY_KEY}'; "
         f"if (Test-Path $p) {{ (Get-ItemProperty -Path $p "
         f"-Name {CMD_POLICY_VAL} -ErrorAction SilentlyContinue)."
         f"{CMD_POLICY_VAL} }} else {{ 'MISSING' }}")
+    if rc != 0:
+        return "UNKNOWN"
     return out.strip() or "MISSING"
 
 
@@ -345,13 +396,22 @@ def set_cmd_policy(value):
         f"New-Item -Path '{CMD_POLICY_KEY}' -Force | Out-Null; "
         f"Set-ItemProperty -Path '{CMD_POLICY_KEY}' "
         f"-Name {CMD_POLICY_VAL} -Value {int(value)} -Type DWord; 'OK'")
-    return "OK" in out
+    return rc == 0 and "OK" in out
 
 
-def auditpol_get():
-    """读文件系统审计子类别（/r = CSV）。auditpol 按系统 ANSI 代码页输出，
+def clear_cmd_policy():
+    """删除 4688 命令行策略值（布雷前它本来就不存在时，这才是原值）。"""
+    rc, out, _ = ps_run(
+        f"$p='{CMD_POLICY_KEY}'; "
+        f"if (Test-Path $p) {{ Remove-ItemProperty -Path $p "
+        f"-Name {CMD_POLICY_VAL} -ErrorAction SilentlyContinue }}; 'OK'")
+    return rc == 0 and "OK" in out
+
+
+def _auditpol_get(subcategory):
+    """读审计子类别（/r = CSV）。auditpol 按系统 ANSI 代码页输出，
     必须按 mbcs 解码，否则中文状态会变成乱码。"""
-    r = subprocess.run(["auditpol", "/get", "/subcategory:" + FS_SUBCAT,
+    r = subprocess.run(["auditpol", "/get", "/subcategory:" + subcategory,
                         "/r"], capture_output=True)
     enc = "mbcs"
     return (r.returncode,
@@ -359,14 +419,22 @@ def auditpol_get():
             (r.stderr or b"").decode(enc, "replace"))
 
 
-def auditpol_fs_enabled():
+def auditpol_get():
+    return _auditpol_get(FS_SUBCAT)
+
+
+def auditpol_on(subcategory):
     """(是否启用, 说明)。"""
-    rc, out, err = auditpol_get()
+    rc, out, err = _auditpol_get(subcategory)
     if rc != 0:
         return False, "auditpol 不可读 — " + (err or out).strip()[:80]
     tail = out.strip().splitlines()[-1] if out.strip() else ""
     on = ("成功" in tail) or ("success" in tail.lower())
     return on, ("已启用（Success）" if on else "未启用（需 --arm）")
+
+
+def auditpol_fs_enabled():
+    return auditpol_on(FS_SUBCAT)
 
 
 def ensure_audit_policy():
@@ -396,11 +464,15 @@ def ensure_audit_policy():
                 state = json.load(f)
         except Exception:
             state = {}
-    if "cmd_policy_before" not in state and prev in ("0", "1"):
-        state["cmd_policy_before"] = int(prev)
+    if "cmd_policy_before" not in state and prev in ("0", "1", "MISSING"):
+        # 第一次布雷前策略键不存在也很常见：必须记 MISSING，
+        # 否则 --disarm 会把它永久留在 1。
+        state["cmd_policy_before"] = (
+            int(prev) if prev in ("0", "1") else "MISSING")
         with open(AUDIT_STATE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False)
-    set_cmd_policy(1)
+    if not set_cmd_policy(1):
+        return False, "设置 4688 命令行策略失败"
     return True, f"cmdline policy {prev} -> 1"
 
 
@@ -413,12 +485,17 @@ def restore_cmd_policy():
                 state = json.load(f)
         except Exception:
             state = {}
+    if "cmd_policy_before" not in state:
+        return "unchanged"
     before = state.get("cmd_policy_before")
-    restored = "unchanged"
-    if before in (0, 1):
-        set_cmd_policy(before)
-        restored = f"restored to {before}"
-    return restored
+    if before in (0, 1, "0", "1"):
+        value = int(before)
+        return (f"restored to {value}" if set_cmd_policy(value)
+                else f"restore to {value} failed")
+    if before == "MISSING":
+        return ("removed (was missing before arming)" if clear_cmd_policy()
+                else "remove failed")
+    return "unchanged"
 
 
 # ---------------------------------------------------------------- 实例管理
@@ -639,7 +716,7 @@ class Mine:
 
 def _new_id(key):
     import hashlib
-    return "m-" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+    return "m-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
 
 
 class MineRegistry:
@@ -652,11 +729,14 @@ class MineRegistry:
     def __init__(self, path=MINES_JSON):
         self.path = path
         self.settings = dict(DEFAULT_SETTINGS)
+        self._settings_extra = {}
+        self.extra = {}
         self.mines = []
         self.load()
 
     def load(self):
         data = {}
+        existed = os.path.exists(self.path)
         try:
             with open(self.path, encoding="utf-8") as f:
                 data = json.load(f)
@@ -664,13 +744,23 @@ class MineRegistry:
             data = {}
         except Exception:
             data = {}
+            existed = False
         if not isinstance(data, dict):
             data = {}
+            existed = False
+        self.extra = {k: v for k, v in data.items()
+                      if k not in ("settings", "mines")}
         st = data.get("settings")
         if isinstance(st, dict):
+            self._settings_extra = {k: v for k, v in st.items()
+                                    if k not in DEFAULT_SETTINGS}
             for k in DEFAULT_SETTINGS:
                 if k in st:
                     self.settings[k] = st[k]
+        else:
+            self._settings_extra = {}
+        old_triggers = {m.id: m.triggers
+                        for m in getattr(self, "mines", [])}
         self.mines = []
         for item in data.get("mines", []) or []:
             if not isinstance(item, dict):
@@ -679,27 +769,34 @@ class MineRegistry:
             if not p:
                 continue
             key = norm_path(p)
-            self.mines.append(
-                Mine(item.get("id") or _new_id(key), p,
+            m = Mine(item.get("id") or _new_id(key), p,
                      item.get("action") or self.settings.get("action",
                                                              ACTION_EXPLODE),
-                     bool(item.get("enabled", True)), item.get("note") or ""))
-        self.ensure_default()
+                     bool(item.get("enabled", True)), item.get("note") or "")
+            m.triggers = old_triggers.get(m.id, 0)
+            self.mines.append(m)
+        self.ensure_default(force=not existed)
 
     def save(self):
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({
-                "settings": self.settings,
-                "mines": [{"id": m.id, "path": m.path, "action": m.action,
-                           "enabled": m.enabled, "note": m.note}
-                          for m in self.mines],
-            }, f, ensure_ascii=False, indent=1)
+            out = dict(self.extra)
+            out["settings"] = {**self._settings_extra, **self.settings}
+            out["mines"] = [
+                {"id": m.id, "path": m.path, "action": m.action,
+                 "enabled": m.enabled, "note": m.note}
+                for m in self.mines]
+            json.dump(out, f, ensure_ascii=False, indent=1)
         os.replace(tmp, self.path)
 
-    def ensure_default(self):
-        """旧版行为：没有配置时守护脚本自己所在的目录。"""
-        if not self.mines:
+    def ensure_default(self, force=False):
+        """旧版行为：没有 mines.json 时守护脚本自己所在的目录。
+
+        只有一个显式的空清单（文件存在、mines: []）表示“不要任何地雷”；
+        这种情况下不能再把默认地雷塞回去，否则 Web UI 里的“移除”永远
+        删不掉最后一个地雷。
+        """
+        if force and not self.mines:
             self.mines.append(Mine(_new_id(norm_path(HERE)), HERE))
 
     def get(self, mine_id):
@@ -737,9 +834,10 @@ class MineRegistry:
 class UploadMonitor:
     """托管 netwatch.py record —— 可疑上传行为的长期观察者。
 
-    它累积出站目标、上传字节数，并把「非已知服务」的新目标写进
-    watch-candidates.txt / watch-blockable.txt。抓包（SNI 补全）只在管理员
-    下自动开启。
+    它累积出站目标（域名/IP）与是否成功建连，并把「非已知服务」的新目标
+    写进 watch-candidates.txt / watch-blockable.txt。上传字节数不在这个
+    模式里统计：那需要 pktmon 抓包，见 netwatch.py deep。SNI 补全只有在
+    显式传入 sni_every 且当前是管理员时才会周期性抓包（用完即删）。
     """
 
     def __init__(self, outdir=HERE, interval=3.0, sni_every=None):
@@ -775,6 +873,12 @@ class UploadMonitor:
                 cmd, stdout=self.log_handle, stderr=subprocess.STDOUT,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except Exception as ex:
+            if self.log_handle:
+                try:
+                    self.log_handle.close()
+                except Exception:
+                    pass
+                self.log_handle = None
             self.last_error = f"启动失败: {ex}"
             return False, self.last_error
         self.started_at = datetime.now()
@@ -862,6 +966,12 @@ class MineSupervisor(threading.Thread):
         """
         self.registry.load()
         cfg = load_config()
+        if CONFIG_ERROR:
+            # 配置坏了不能把宿主应用名单清空：那会让“永不击杀”的承诺失效。
+            # 保留上一份名单，由启动检查/体检提示用户修复。
+            print("[WARN] watch-config.json 解析失败，保留上一份宿主应用名单",
+                  flush=True)
+            return list(self.mines)
         self.host_apps = load_host_apps(cfg)
         self.tree_warn_roots = BASE_TREE_WARN_ROOTS | self.host_apps
         self.protected = SYSTEM_PROTECTED | self.host_apps
@@ -883,10 +993,15 @@ class MineSupervisor(threading.Thread):
 
     # ---- 进程表 ----
     def seed_snapshot(self):
-        rc, out, _ = ps_run(
-            "Get-CimInstance Win32_Process | Select-Object ProcessId,"
-            "ParentProcessId,Name,CommandLine,ExecutablePath,CreationDate | "
-            "ConvertTo-Json -Compress", timeout=90)
+        try:
+            rc, out, _ = ps_run(
+                "Get-CimInstance Win32_Process | Select-Object ProcessId,"
+                "ParentProcessId,Name,CommandLine,ExecutablePath,CreationDate | "
+                "ConvertTo-Json -Compress", timeout=90)
+        except (subprocess.TimeoutExpired, OSError) as ex:
+            print(f"[WARN] 初始进程快照失败（{type(ex).__name__}），"
+                  f"祖先判定退化为按需查询", flush=True)
+            return False
         if rc != 0 or not out.strip():
             print("[WARN] 初始进程快照失败，祖先判定退化为 origin 规则",
                   flush=True)
@@ -911,6 +1026,30 @@ class MineSupervisor(threading.Thread):
             }
         return True
 
+    def record_self_ancestry(self):
+        """把守护进程自身的祖先链加入永不击杀集合。
+
+        只保护 self_pid 不够：控制台/终端/explorer 都在链上，误杀它们
+        同样会打断用户会话。README 承诺“拒绝击杀自己的祖先链”，这里
+        在启动时把整条链记下来，之后 fire() 直接拒绝。
+        """
+        try:
+            cur = self.self_pid
+            seen = set()
+            while cur and cur not in seen and len(self.self_ancestors) < 32:
+                seen.add(cur)
+                self.self_ancestors.add(cur)
+                info = self.proc.get(cur)
+                if info is None:
+                    self.cim_lookup([cur])
+                    info = self.proc.get(cur)
+                if info is None:
+                    break
+                cur = info.get("ppid")
+        except (subprocess.TimeoutExpired, OSError) as ex:
+            print(f"[WARN] 记录自身祖先链失败（{type(ex).__name__}），"
+                  f"仍保护自身 PID", flush=True)
+
     def cim_lookup(self, pids, force=False):
         """对进程表里**缺失或不完整**的 pid 做实时 CIM 补查。
 
@@ -930,10 +1069,13 @@ class MineSupervisor(threading.Thread):
             if force:
                 self._lookup_missed.discard(p)
         flt = " OR ".join(f"ProcessId={p}" for p in todo[:8])
-        rc, out, _ = ps_run(
-            f"Get-CimInstance Win32_Process -Filter '{flt}' | Select-Object "
-            "ProcessId,ParentProcessId,Name,CommandLine,ExecutablePath | "
-            "ConvertTo-Json -Compress", timeout=15)
+        try:
+            rc, out, _ = ps_run(
+                f"Get-CimInstance Win32_Process -Filter '{flt}' | Select-Object "
+                "ProcessId,ParentProcessId,Name,CommandLine,ExecutablePath | "
+                "ConvertTo-Json -Compress", timeout=15)
+        except (subprocess.TimeoutExpired, OSError):
+            return
         if rc != 0 or not out.strip():
             return
         try:
@@ -998,16 +1140,29 @@ class MineSupervisor(threading.Thread):
         """
         info = self.proc.get(pid, {})
         name = info.get("name") or "?"
-        if pid == self.self_pid or name in self.protected \
-                or pid in PROTECTED_PIDS or pid < 8:
+        # PID 级硬保护先做，不依赖进程表是否完整。
+        if pid == self.self_pid or pid in PROTECTED_PIDS or pid < 8:
             log("WARN", mine=mine.id, pid=pid, name=name,
                 note="protected/self，拒绝击杀", why=why, **evidence)
+            return "refused"
+        # 先解析进程/祖先，再按真实映像名复查保护名单。进程表里暂时缺
+        # 这个 PID 时 name 会是 "?"，不能拿 "?" 去比对 SYSTEM_PROTECTED
+        # 或 host_apps——那等于让保护名单在信息缺失时失效。
+        chain, root = self.ancestry(pid)
+        info = self.proc.get(pid, {})
+        name = info.get("name") or "?"
+        if name in self.protected:
+            log("WARN", mine=mine.id, pid=pid, name=name,
+                note="protected/宿主应用，拒绝击杀", why=why, **evidence)
             return "refused"
         if pid in self.self_ancestors:
             log("WARN", mine=mine.id, pid=pid, name=name,
                 note="自身祖先链，拒绝击杀", why=why, **evidence)
             return "refused"
-        chain, root = self.ancestry(pid)
+        if name == "?":
+            log("WARN", mine=mine.id, pid=pid, name=name,
+                note="进程身份无法确认，拒绝处置", why=why, **evidence)
+            return "refused"
         mine.triggers += 1
         forensics = {
             "mine": mine.id,
@@ -1070,7 +1225,7 @@ class MineSupervisor(threading.Thread):
             return                    # 资源管理器等 GUI 复制=用户亲手操作
         if not mine.owns_cmd(cmd):
             return                    # 不涉及本守护目录
-        if not COPY_VERBS.search(cmd.lower()):
+        if not has_copy_semantics(cmd):
             return                    # 无复制/上传语义
         dests = []
         exelow = (info.get("exe") or "").lower()
@@ -1084,21 +1239,38 @@ class MineSupervisor(threading.Thread):
                 continue              # 目录内=源或中间产物
             if tok.lower() == exelow or tok.lower().endswith("\\" + name):
                 continue              # 进程自身映像路径
-            if re.match(r"(?i)^(https?|ftp|sftp)://", tok) or \
-                    re.match(r"(?i)^[a-z0-9._-]+@[a-z0-9.-]+:", tok) or \
+            if re.match(r"(?i)^(https?|ftp|sftp)://", tok):
+                if not is_loopback_url(tok):
+                    dests.append(tok)
+            elif re.match(r"(?i)^[a-z0-9._-]+@[a-z0-9.-]+:", tok) or \
                     is_abs_path(tok):
                 dests.append(tok)
         if not dests:
             return
-        if name in SHELL_NAMES:
-            chain, root = self.ancestry(pid)
-            if root in ("session", "self"):
-                # 命令行里"提到"搬运 ≠ 执行搬运：会话树内的 shell 只告警，
-                # 真正的执行者（robocopy/cmd 子进程等）会以自身出生事件被击杀
-                log("WARN", mine=mine.id, pid=pid, name=name, tree_root=root,
-                    note="会话树内 shell 命令含搬运语义",
-                    dest=dests[:4], cmdline_head=cmd[:300])
-                return
+
+        chain, root = self.ancestry(pid)
+        if root == "self":
+            # 守护进程自己的进程树：不处置。它不执行搬运，杀它只会打断自己。
+            log("WARN", mine=mine.id, pid=pid, name=name, tree_root=root,
+                note="自身进程树，拒绝处置",
+                dest=dests[:4], cmdline_head=cmd[:300])
+            return
+        if name in SHELL_NAMES and root == "session":
+            # 命令行里"提到"搬运 ≠ 执行搬运：会话树内的 shell 只告警，
+            # 真正的执行者（robocopy/cmd 子进程等）会以自身出生事件被击杀
+            log("WARN", mine=mine.id, pid=pid, name=name, tree_root=root,
+                note="会话树内 shell 命令含搬运语义",
+                dest=dests[:4], cmdline_head=cmd[:300])
+            return
+        if root == "unknown" and not self.strict_orphans:
+            # 父进程已经退出、来源无法确认。按硬边界"不猜"：只告警。
+            # 日志里真实出现过 ZCode 自己的 bash/curl 因父 shell 先退出
+            # 被归为 unknown 而遭击杀——这正是必须避免的误杀。
+            log("WARN", mine=mine.id, pid=pid, name=name, tree_root=root,
+                note="来源无法确认（父进程已退出）；仅告警"
+                     "（--strict-orphans 可击杀）",
+                dest=dests[:4], cmdline_head=cmd[:300])
+            return
         self.fire(mine, pid,
                   "LayerB 出生搬运：守护目录源 + 目录外目的地",
                   {"dest": dests[:4], "cmdline_head": cmd[:300]})
@@ -1200,6 +1372,22 @@ class MineSupervisor(threading.Thread):
 
     # ---- 主循环 ----
     def run(self):
+        """线程入口：任何启动/运行异常都落到 last_error，供 CLI/Web UI 展示。"""
+        try:
+            self._run()
+        except Exception as ex:
+            self.last_error = f"{type(ex).__name__}: {ex}"
+            self.phase = "运行异常：" + self.last_error
+            log("START_FAILED", error=self.last_error)
+            try:
+                self.disarm_all()
+                restore_cmd_policy()
+            except Exception:
+                pass
+            clear_pid(self.self_pid)
+            self.running = False
+
+    def _run(self):
         if not is_admin():
             self.last_error = "需要管理员权限（Security 日志 / SACL）"
             self.phase = "启动失败：需要管理员权限"
@@ -1207,6 +1395,16 @@ class MineSupervisor(threading.Thread):
             return
         self.phase = "读取配置"
         self.reload()
+        if CONFIG_ERROR:
+            self.last_error = "watch-config.json 解析失败：" + CONFIG_ERROR
+            self.phase = "启动失败：" + self.last_error
+            log("START_FAILED", error=self.last_error)
+            return
+        # 初始快照必须在轮询线程启动前完成：它让祖先判定不必为每个新进程
+        # 逐个支起 PowerShell 查询，也让“自己的祖先链”能被完整记录。
+        self.phase = "读取进程快照"
+        self.seed_snapshot()
+        self.record_self_ancestry()
         self.phase = "启用审计策略"
         ok, msg = ensure_audit_policy()
         if not ok:
@@ -1246,8 +1444,9 @@ class MineSupervisor(threading.Thread):
         finally:
             self.running = False
             self.disarm_all()
+            restored = restore_cmd_policy()
             clear_pid(self.self_pid)
-            log("STOP", pid=self.self_pid)
+            log("STOP", pid=self.self_pid, cmd_policy=restored)
 
     def stop(self, timeout=10):
         self._stop.set()
@@ -1256,6 +1455,26 @@ class MineSupervisor(threading.Thread):
 
 
 # ---------------------------------------------------------------- 体检
+
+def security_log_info():
+    """Security 日志的 (最大字节数, 记录数, 模式)；读不到返回 (None, 0, "")。"""
+    ps = ("$l = Get-WinEvent -ListLog Security; "
+          "if (-not $l) { '{}' } else { [pscustomobject]@{"
+          "maximum=$l.MaximumSizeInBytes; records=$l.RecordCount; "
+          "mode=[string]$l.LogMode} | ConvertTo-Json -Compress }")
+    try:
+        rc, out, _ = ps_run(ps, timeout=30)
+    except (subprocess.TimeoutExpired, OSError):
+        return None, 0, ""
+    if rc != 0 or not out.strip():
+        return None, 0, ""
+    try:
+        d = json.loads(out)
+        return (int(d.get("maximum") or 0), int(d.get("records") or 0),
+                str(d.get("mode") or ""))
+    except (AttributeError, TypeError, ValueError):
+        return None, 0, ""
+
 
 def run_checks(registry=None):
     """体检：权限 / 审计策略 / 事件日志 / 各地雷的布雷状态。
@@ -1275,6 +1494,9 @@ def run_checks(registry=None):
         {"name": "宿主应用", "ok": bool(hosts),
          "detail": ", ".join(sorted(hosts)) or "未配置（其读取只告警）"},
     ]
+    if CONFIG_ERROR:
+        checks.append({"name": "watch-config.json", "ok": False,
+                       "detail": "解析失败：" + CONFIG_ERROR})
 
     rc, out, err = auditpol_get()
     checks.append({"name": "auditpol 文件系统审计", "ok": rc == 0,
@@ -1283,6 +1505,10 @@ def run_checks(registry=None):
     on, detail = auditpol_fs_enabled()
     checks[-1]["ok"] = rc == 0 and on
     checks[-1]["detail"] = detail
+
+    on, detail = auditpol_on(PROC_SUBCAT)
+    checks.append({"name": "auditpol 进程创建审计", "ok": on,
+                   "detail": detail})
 
     pol = read_cmd_policy()
     checks.append({"name": "4688 命令行记录", "ok": pol == "1",
@@ -1294,6 +1520,17 @@ def run_checks(registry=None):
                    "detail": "可读" if rc == 0
                              else "不可读 — " + err.strip()[:80]})
 
+    max_b, records, mode = security_log_info()
+    if max_b:
+        detail = f"{max_b / (1024 * 1024):.1f} MB / {records} 条 / {mode}"
+        if max_b < 64 * 1024 * 1024:
+            detail += "（建议 ≥64 MB：wevtutil sl Security /ms:67108864）"
+        checks.append({"name": "Security 日志容量",
+                       "ok": max_b >= 16 * 1024 * 1024, "detail": detail})
+    else:
+        checks.append({"name": "Security 日志容量", "ok": False,
+                       "detail": "无法读取日志配置"})
+
     for m in reg.mines:
         if not m.exists:
             m.armed = False
@@ -1303,24 +1540,32 @@ def run_checks(registry=None):
         present, detail = sacl_present(m.path)
         m.armed = present
         if present:
-            state = "已布雷"
+            state = "已布雷" if m.enabled else "已布雷（地雷已停用，等待排雷）"
+            ok = True
         elif not m.enabled:
             state = "未布雷（地雷已停用）"
+            ok = True                 # 停用是用户的选择，不是故障
         else:
             state = f"未布雷 — 未检测到 ACE [{detail[:60]}]"
+            ok = False
         checks.append({
             "name": f"守护目录 {m.path}",
-            "ok": present,
+            "ok": ok,
             "detail": state,
             "mine": m.id,
         })
 
     pid = read_pid()
     others = find_other_instances()
+    if pid:
+        detail = f"运行中 PID {pid}"
+    elif others:
+        detail = f"命令行实例运行中 PID {others}"
+    else:
+        detail = "未运行"
     checks.append({
         "name": "地雷进程",
-        "ok": bool(pid),
-        "detail": f"运行中 PID {pid}" if pid else
-                  ("未运行" + (f"（另有命令行实例 {others}）" if others else "")),
+        "ok": bool(pid or others),
+        "detail": detail,
     })
     return checks

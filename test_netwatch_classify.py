@@ -14,8 +14,6 @@ test_netwatch_classify.py —— netwatch 目标定性的回归测试
 import importlib.util
 import ipaddress
 import os
-import random
-import sys
 import tempfile
 import time
 import unittest
@@ -23,11 +21,11 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-def load_netwatch(config=None):
-    """以指定的 watch-config.json 内容加载 netwatch 模块。
+def load_netwatch():
+    """加载 netwatch 模块。
 
-    netwatch 在导入时读配置，所以测试要先把临时配置就位——用环境变量
-    让 netwatch 指向它（NG_CONFIG 不存在时退回默认路径）。
+    测试随后覆盖模块内的标记/网段全局变量，因此不写任何配置文件——
+    既不会碰仓库里的真实 watch-config.json，也不依赖本机配置。
     """
     path = os.path.join(HERE, "netwatch.py")
     spec = importlib.util.spec_from_file_location("nw_test", path)
@@ -54,27 +52,22 @@ class Base(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._tmp = tempfile.mkdtemp(prefix="nw-cfg-")
-        cls._old = os.path.join(HERE, "watch-config.json")
-        cls._backup = None
-        if os.path.exists(cls._old):
-            with open(cls._old, encoding="utf-8") as f:
-                cls._backup = f.read()
-        import json
-        with open(cls._old, "w", encoding="utf-8") as f:
-            json.dump(cls.CFG, f, ensure_ascii=False)
         cls.nw = load_netwatch()
+        # 直接覆盖导入后的全局变量：与写一份临时 watch-config.json 等价，
+        # 但不会碰用户的真实配置（测试中断也不会有损失）。
+        cls.nw.SUSPICIOUS_MARKERS_LIST = (
+            ("cloud-example.test", ""),
+            ("oss-", ""),
+            ("broad.test", "宽泛厂商"),
+            ("bucket.broad.test", "具体存储"),
+        )
+        cls.nw.AD_MARKERS_LIST = (("ads.broad.test", "具体广告"),)
+        cls.nw._CLOUD_RANGES = cls.nw._build_ranges(["203.0.113.0/24"])
+        cls.nw._CLOUD_STARTS = [r[0] for r in cls.nw._CLOUD_RANGES]
 
     @classmethod
     def tearDownClass(cls):
         import shutil
-        if cls._backup is not None:
-            with open(cls._old, "w", encoding="utf-8") as f:
-                f.write(cls._backup)
-        else:
-            try:
-                os.remove(cls._old)
-            except OSError:
-                pass
         shutil.rmtree(cls._tmp, ignore_errors=True)
 
     # ---- 1. 最长命中 ----
@@ -140,7 +133,6 @@ class Base(unittest.TestCase):
 
     def test_lookup_is_fast_with_many_ranges(self):
         """几万条区间下，单次查询必须是微秒级（二分），不能是线性扫描。"""
-        rnd = random.Random(1234)
         cidrs = []
         base = int(ipaddress.ip_address("1.0.0.0"))
         for i in range(30000):

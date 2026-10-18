@@ -4,14 +4,22 @@
 #   A pattern without '*' also matches all subdomains.
 #   Decision order: exclusions > this table > cloud-provider fallback > unknown.
 #
-# Categories listed in the script's BENIGN_CATEGORIES are not flagged.
-# Anything else is reported as "needs review".
+# IMPORTANT: the category is a fixed vocabulary, not a free-form label.
+#   Benign (never flagged, never blocked):
+#     模型提供商 | 厂商基础设施 | 更新/镜像/CDN | 本机开发 | 已知排除 | 本地环回 | 私有网络
+#   Label-only (own section in the report, never blocked):
+#     广告/统计
+#   Anything else is "needs review" and lands in watch-candidates.txt /
+#   watch-blockable.txt. Use the canonical names above. An English label such
+#   as "Model API" would be treated as suspicious and exported for blocking.
+#   See BENIGN_CATEGORIES / LABEL_ONLY_CATEGORIES in netwatch.py.
 
 # ---- documented services of the application you are studying ----
-Model API      | api.example.com        | provider API
-Model API      | *.example-cdn.com      | static assets
+模型提供商 | api.example.com          | provider API
+模型提供商 | *.example-cdn.com        | static assets
+更新/镜像/CDN | *.download.example.net | app updates
 
 # ---- things that would explain an upload: watch these closely ----
-Logging        | *.logsvc.example.net   | remote logging
-Object Storage | *.storage.example.net  | file upload target
-Analytics      | *.metrics.example.net  | telemetry
+日志/链路遥测 | *.logsvc.example.net  | remote logging
+对象存储 | *.storage.example.net      | file upload target
+广告/统计 | *.metrics.example.net      | analytics (label only; never blocked)

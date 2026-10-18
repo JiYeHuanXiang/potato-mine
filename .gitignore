@@ -5,6 +5,7 @@
 !/.gitignore
 !/.gitattributes
 !/README.md
+!/README.zh-CN.md
 !/LICENSE
 !/netwatch.py
 !/potato_mine.py

@@ -74,6 +74,9 @@ def cmd_arm():
         sys.exit("布雷失败：" + msg)
     print(f"[ARM] 审计已启用：File System + Process Creation（{msg}）")
     for m in reg.mines:
+        if not m.enabled:
+            print(f"[SKIP] 已停用：{m.path}")
+            continue
         if not m.exists:
             print(f"[SKIP] 目录不存在：{m.path}")
             continue
@@ -138,6 +141,15 @@ def cmd_stop():
         mc.clear_pid()
         return 0
     for pid in victims:
+        try:
+            _rc, cmdline, _err = mc.ps_run(
+                f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}' "
+                f"-ErrorAction SilentlyContinue).CommandLine", timeout=15)
+            if "webui.py" in (cmdline or "").lower():
+                print(f"[STOP] 注意：PID {pid} 是网页控制台（它托管着地雷）；"
+                      f"控制台会一并退出。下次请优先用控制台的停止按钮。")
+        except Exception:
+            pass
         subprocess.run(["taskkill", "/F", "/PID", str(pid)],
                        capture_output=True, errors="replace")
     mc.log("STOP", pids=victims)
@@ -178,6 +190,9 @@ def cmd_run(dry_run=False, strict_orphans=False):
     except KeyboardInterrupt:
         print("\n[STOP] 收到中断，正在停止…", flush=True)
         sup.stop()
+    if sup.last_error:
+        print(f"[FAIL] {sup.phase}: {sup.last_error}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -190,7 +205,8 @@ def main():
     ap.add_argument("--dry-run", action="store_true",
                     help="只记录不击杀（等价于把触发动作设为「警告」）")
     ap.add_argument("--strict-orphans", action="store_true",
-                    help="对高危孤儿进程也击杀（默认只告警）")
+                    help="来源无法确认（父进程已退出）的搬运进程也击杀"
+                         "（默认只告警）")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--stop", action="store_true")
     ap.add_argument("--list", action="store_true")

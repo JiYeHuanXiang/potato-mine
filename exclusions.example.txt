@@ -2,10 +2,19 @@
 #
 # Destinations that are expected on this machine and should never be
 # reported as suspicious — your own infrastructure, VPN, update mirrors.
-# Format: one entry per line, same syntax as the rules file (domain pattern),
-# or a comment starting with '#'.
+#
+# Format: destination | note
+#   destination may be:
+#     - an IP (203.0.113.7) or CIDR (203.0.113.0/24)
+#     - a domain pattern, with the same wildcard rules as rules.txt
+#     - proc:<process name> to exclude a whole process by name
+#   Lines starting with '#' are comments.
+#
+# Exclusions are checked before classification and are never exported to
+# watch-candidates.txt / watch-blockable.txt.
 
 # local development / tunnelling you run yourself
-*.your-vpn.example
-localhost
-127.0.0.1
+*.your-vpn.example | your VPN
+localhost | local loopback
+127.0.0.1 | local loopback
+# proc:frpc.exe | your own tunnel client
